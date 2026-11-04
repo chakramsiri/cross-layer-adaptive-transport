@@ -1,0 +1,3 @@
+qdisc netem 8001: root refcnt 21 limit 10000 delay 50ms loss 10% reorder 25% 50% gap 1
+ Sent 11375756 bytes 10663 pkt (dropped 1201, overlimits 0 requeues 722) 
+ backlog 0b 0p requeues 722

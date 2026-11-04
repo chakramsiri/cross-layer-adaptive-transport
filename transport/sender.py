@@ -130,8 +130,19 @@ def send_file(input_file, receiver_ip):
     next_seq = 0
 
     outstanding = {}
-    send_times = {}
     retries = {}
+
+    # Single retransmission timer for the earliest unacknowledged packet.
+    # RFC 6298 keeps one timer for outstanding data; Phase 2 makes the
+    # interval adaptive, Phase 1 keeps the fixed TIMEOUT.
+    base_send_time = None
+
+    # Three-duplicate-ACK fast retransmit state. One duplicate-triggered
+    # retransmission is allowed per recovery event, i.e. until the window
+    # base advances; base_retx_done also suppresses a fast retransmit right
+    # after a timeout retransmission of the same packet.
+    duplicate_acks = 0
+    base_retx_done = False
 
     sock.settimeout(SOCKET_POLL_INTERVAL)
 
@@ -148,8 +159,10 @@ def send_file(input_file, receiver_ip):
             sock.sendto(packet.pack(), receiver_address)
 
             outstanding[next_seq] = packet
-            send_times[next_seq] = time.monotonic()
             retries[next_seq] = 0
+
+            if next_seq == base:
+                base_send_time = time.monotonic()
 
             logger.log(
                 "PACKET_SENT",
@@ -167,6 +180,9 @@ def send_file(input_file, receiver_ip):
 
         if ack_number is not None:
             if base < ack_number <= next_seq:
+                # New data acknowledged: advance the window base, restart
+                # the retransmission timer and reset duplicate-ACK tracking
+                # for the next recovery event.
                 print(
                     f"Cumulative ACK {ack_number} received. "
                     f"Window base: {base} -> {ack_number}"
@@ -174,48 +190,98 @@ def send_file(input_file, receiver_ip):
 
                 for seq in range(base, ack_number):
                     outstanding.pop(seq, None)
-                    send_times.pop(seq, None)
                     retries.pop(seq, None)
 
                 base = ack_number
+                duplicate_acks = 0
+                base_retx_done = False
 
-        # Retransmit expired packets
-        current_time = time.monotonic()
+                if base < total_packets:
+                    base_send_time = time.monotonic()
 
-        for seq in list(outstanding.keys()):
-            if current_time - send_times[seq] >= TIMEOUT:
+            elif ack_number == base and base < next_seq:
+                # Duplicate ACK: the same outstanding data is still the left
+                # window edge. Count it; on the third one, retransmit the
+                # earliest missing packet immediately (fast retransmit).
+                duplicate_acks += 1
 
-                if retries[seq] >= MAX_RETRIES:
-                    print(f"Packet {seq} exceeded maximum retries.")
+                logger.log(
+                    "DUPLICATE_ACK",
+                    packet_type="ACK",
+                    ack=ack_number,
+                    details=f"count={duplicate_acks}"
+                )
+
+                if (
+                    duplicate_acks == 3
+                    and not base_retx_done
+                    and retries[base] < MAX_RETRIES
+                ):
+                    retries[base] += 1
+                    attempt = retries[base] + 1
+
+                    print(
+                        f"3 duplicate ACKs: fast retransmitting "
+                        f"packet {base}, attempt {attempt}"
+                    )
+
+                    sock.sendto(
+                        outstanding[base].pack(), receiver_address
+                    )
+
+                    logger.log(
+                        "RETRANSMISSION",
+                        packet_type="DATA",
+                        seq=base,
+                        byte_count=len(outstanding[base].payload),
+                        attempt=attempt,
+                        details="Fast retransmit (3 duplicate ACKs)"
+                    )
+
+                    base_retx_done = True
+                    base_send_time = time.monotonic()
+
+        # Single retransmission timer: on expiry retransmit only the earliest
+        # unacknowledged packet and restart the timer. The receiver buffers
+        # out-of-order data and flushes it once the gap is filled, so
+        # retransmitting more than the base packet only creates duplicates.
+        if base < next_seq and base_send_time is not None:
+            current_time = time.monotonic()
+
+            if current_time - base_send_time >= TIMEOUT:
+
+                if retries[base] >= MAX_RETRIES:
+                    print(f"Packet {base} exceeded maximum retries.")
                     logger.log(
                         "TRANSFER_FAILED",
                         packet_type="DATA",
-                        seq=seq,
+                        seq=base,
                         details="Maximum retries exceeded"
                     )
                     sock.close()
                     return
 
-                retries[seq] += 1
-                attempt = retries[seq] + 1
+                retries[base] += 1
+                attempt = retries[base] + 1
 
                 print(
-                    f"Timeout! Retransmitting packet {seq}, "
+                    f"Timeout! Retransmitting packet {base}, "
                     f"attempt {attempt}"
                 )
 
-                sock.sendto(outstanding[seq].pack(), receiver_address)
+                sock.sendto(outstanding[base].pack(), receiver_address)
 
                 logger.log(
                     "RETRANSMISSION",
                     packet_type="DATA",
-                    seq=seq,
-                    byte_count=len(outstanding[seq].payload),
+                    seq=base,
+                    byte_count=len(outstanding[base].payload),
                     attempt=attempt,
                     details="Timeout"
                 )
 
-                send_times[seq] = time.monotonic()
+                base_send_time = time.monotonic()
+                base_retx_done = True
 
     print("\nAll DATA packets acknowledged.")
 
