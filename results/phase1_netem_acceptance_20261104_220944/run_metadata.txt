@@ -1,0 +1,39 @@
+Phase 1 Mininet/netem Acceptance Test
+
+Topology:
+h1 (10.0.0.1) -- s1 (Open vSwitch) -- h2 (10.0.0.2)
+
+Transport:
+Custom reliable UDP
+Port: 5001
+File size: 10,485,760 bytes
+Chunk size: 1000 bytes
+
+DATA path:
+h1-eth0
+netem limit 10000
+delay 50ms
+loss 10%
+reorder 25% 50%
+
+ACK path:
+h2-eth0
+netem limit 10000
+delay 50ms
+loss 10%
+
+Expected baseline RTT: approximately 100ms.
+
+Expected result:
+Successful transfer and matching SHA-256 hashes.
+
+Original SHA-256:
+fab77486d24601ab29299d6b58ccdc41d7a7bbfac3b89ada9343576ce5f228f4
+
+DATA qdisc:
+10663 sent, 1201 dropped, 722 requeues.
+
+ACK qdisc:
+9590 sent, 1082 dropped, 0 requeues.
+
+Both sender and receiver exited successfully.
