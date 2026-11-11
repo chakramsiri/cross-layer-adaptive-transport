@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
+from transport.cc.reno import RenoController
 from transport.packet import Packet, DATA, ACK, SYN, FIN
 from transport.csv_logger import CSVLogger
 from transport import sender as sender_module
@@ -24,11 +25,7 @@ _port_cursor = TEST_PORT_RANGE_START
 
 
 def pick_test_port():
-    """Return the next free UDP port from a local, non-ephemeral range.
-
-    The range stays below Linux's ephemeral ports (>= 32768), so stray
-    packets from lingering threads can never arrive here.
-    """
+    """Return the next available port from the test suite's port range."""
 
     global _port_cursor
 
@@ -66,8 +63,6 @@ class ScriptedPeer:
 
     def close(self):
         self.sock.close()
-
-    #  receiving
 
     def _recv_raw(self, timeout):
         self.sock.settimeout(max(0.01, timeout))
@@ -172,8 +167,6 @@ class ScriptedPeer:
 
         return False
 
-    #  sending
-
     def send_ack(self, ack, ts_echo=0, rwnd=None):
         """Send an ACK, defaulting to the peer's currently advertised rwnd."""
 
@@ -189,22 +182,19 @@ class ScriptedPeer:
 
 
 class _DiscardLogger:
-    """Logger stand-in that drops every row (protects results/ logs)."""
+    """No-op logger used while a sender thread is shutting down."""
 
     def log(self, *args, **kwargs):
         pass
 
 
 class SenderTestBase(unittest.TestCase):
-    """Deterministic harness for sender-side tests.
-
-    Runs transport.sender.send_file in a background thread against a
-    ScriptedPeer, isolating module globals (port, logger) per test.
-    Subclasses set CHUNKS (payloads) and PEER_RWND (advertised window).
-    """
+    """Base fixture for sender tests using a scripted UDP peer."""
 
     CHUNKS = [bytes([65 + index]) * 1000 for index in range(5)]
     PEER_RWND = DEFAULT_RWND
+    INITIAL_CWND = sender_module.WINDOW_SIZE
+    CONTROLLER_ENABLED = True
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -221,21 +211,26 @@ class SenderTestBase(unittest.TestCase):
         sender_module.logger = CSVLogger(str(self.log_path))
         self.addCleanup(self._restore_sender_module)
 
+        if self.CONTROLLER_ENABLED:
+            self.controller = RenoController(
+                initial_cwnd=float(self.INITIAL_CWND)
+            )
+        else:
+            self.controller = None
+
         # Bind the peer before the sender starts so the SYN cannot be lost.
         self.peer = ScriptedPeer(self.port)
         self.peer.rwnd = self.PEER_RWND
         self.addCleanup(self.peer.close)
 
         self.sender_error = None
+        self.sender_result = None
         self.thread = threading.Thread(target=self._run_sender, daemon=True)
         self.addCleanup(self._stop_sender_quietly)
         self.thread.start()
 
-    #  setup
-
     def _restore_sender_module(self):
-        # Restore globals unconditionally so a failed test cannot poison
-        # later ones; a still-alive thread gets a discarding logger.
+        # Redirect a lingering sender thread away from the shared logger.
         if self.thread.is_alive():
             sender_module.logger = _DiscardLogger()
 
@@ -247,26 +242,23 @@ class SenderTestBase(unittest.TestCase):
     def _run_sender(self):
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                sender_module.send_file(str(self.input_path), "127.0.0.1")
+                self.sender_result = sender_module.send_file(
+                    str(self.input_path), "127.0.0.1", self.controller
+                )
         except Exception as error:  # pragma: no cover - failure path
             self.sender_error = error
 
     def _stop_sender_quietly(self):
-        """Best-effort completion so a failed test cannot leak a thread.
-
-        The ACK sweep is state-agnostic: it acknowledges every cumulative
-        point until the sender completes, whatever state the test left.
-        """
+        """Try to finish a sender left running by a failed test."""
 
         if not self.thread.is_alive():
             return
 
         try:
             if self.peer.sender_addr is None:
-                # With SYN backoff the first retry waits 2 s (RFC 6298 5.5).
                 self.peer.accept_syn(timeout=2.6)
         except Exception:
-            # Still run the sweep and join below so globals can be restored.
+            # Continue cleanup if the handshake fails.
             pass
 
         deadline = time.monotonic() + 2.0
@@ -280,8 +272,6 @@ class SenderTestBase(unittest.TestCase):
             pass
 
         self.thread.join(timeout=0.5)
-
-    #  scenario helpers
 
     def open_window(self):
         """SYN handshake plus the initial window of DATA packets."""

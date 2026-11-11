@@ -1,12 +1,4 @@
-"""Deterministic regression tests for three-duplicate-ACK fast retransmit
-and the single-timer (earliest-unacked-packet) timeout retransmission.
-
-Covers the Phase 1 remediation acceptance list: fast retransmit on exactly
-three duplicate ACKs (not one or two), counter reset on new data, one
-retransmission per loss event, timeout hitting only the earliest unacked
-packet, correct bytes after genuine loss, spurious-retransmit safety, and
-fast retransmit arriving before the RTO expires.
-"""
+"""Tests fast retransmission and timeout recovery."""
 
 import contextlib
 import csv
@@ -18,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from transport import sender as sender_module
+from transport.cc.reno import RenoController
 from transport.csv_logger import CSVLogger
 
 from tests.helpers import ScriptedPeer, pick_test_port
@@ -50,11 +43,8 @@ class FastRetransmitTests(unittest.TestCase):
         self.addCleanup(self._stop_sender_quietly)
         self.thread.start()
 
-    #  setup / teardown
-
     def _restore_sender_module(self):
-        # Keep the temp logger/port while the thread lives: a stray
-        # retransmission must not append to the repository's results/ logs.
+        # Keep the test logger installed until the sender thread exits.
         if self.thread.is_alive():
             return
 
@@ -64,7 +54,11 @@ class FastRetransmitTests(unittest.TestCase):
     def _run_sender(self):
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                sender_module.send_file(str(self.input_path), "127.0.0.1")
+                sender_module.send_file(
+                    str(self.input_path),
+                    "127.0.0.1",
+                    RenoController(initial_cwnd=sender_module.WINDOW_SIZE),
+                )
         except Exception as error:  # pragma: no cover - failure path
             self.sender_error = error
 
@@ -76,7 +70,6 @@ class FastRetransmitTests(unittest.TestCase):
 
         try:
             if self.peer.sender_addr is None:
-                # With SYN backoff the first retry waits 2 s (RFC 6298 5.5).
                 self.peer.accept_syn(timeout=2.6)
         except Exception:
             return
@@ -89,8 +82,6 @@ class FastRetransmitTests(unittest.TestCase):
             pass
 
         self.thread.join(timeout=1.0)
-
-    #  helpers
 
     def _open_window(self):
         """Complete the SYN handshake and collect the initial 5 DATA packets."""
@@ -151,7 +142,6 @@ class FastRetransmitTests(unittest.TestCase):
 
         return min(0.5, sender_module.TIMEOUT / 2)
 
-    # tests
 
     def test_three_duplicate_acks_trigger_fast_retransmit_before_rto(self):
         self._open_window()

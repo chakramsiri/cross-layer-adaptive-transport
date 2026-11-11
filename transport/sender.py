@@ -2,6 +2,7 @@ import socket
 import sys
 import time
 
+from transport.cc.reno import RenoController
 from transport.packet import Packet, DATA, ACK, SYN, FIN
 from transport.csv_logger import CSVLogger
 from transport.rtt import MAX_RTO, RttEstimator, encode_timestamp, rtt_seconds
@@ -116,7 +117,16 @@ def receive_ack(sock, receiver_address):
     return None, None
 
 
-def send_file(input_file, receiver_ip):
+_CONTROLLER_UNSET = object()
+
+
+def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
+    """Omitting controller enables Reno; explicit None disables
+    congestion control"""
+
+    if controller is _CONTROLLER_UNSET:
+        controller = RenoController()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver_address = (receiver_ip, PORT)
 
@@ -130,6 +140,11 @@ def send_file(input_file, receiver_ip):
 
     total_packets = len(chunks)
     total_bytes = sum(len(chunk) for chunk in chunks)
+
+    # Maximum data payload permitted by the sender's configuration
+    # (CHUNK_SIZE, or the rechunk size for a small receiver window);
+    # FlightSize and ACK growth are reported in these units.
+    smss = CHUNK_SIZE
 
     print(f"File size: {total_bytes} bytes")
     print(f"Total DATA packets: {total_packets}")
@@ -146,8 +161,14 @@ def send_file(input_file, receiver_ip):
 
     if syn_ack is None:
         print("SYN handshake failed.")
+        logger.log(
+            "TRANSFER_FAILED",
+            packet_type="SYN",
+            seq=0,
+            details="SYN handshake failed"
+        )
         sock.close()
-        return
+        return False
 
     print("SYN handshake successful.\n")
 
@@ -161,6 +182,7 @@ def send_file(input_file, receiver_ip):
             for i in range(0, len(data), syn_ack.rwnd)
         ]
         total_packets = len(chunks)
+        smss = syn_ack.rwnd
 
         print(
             f"Advertised window {syn_ack.rwnd} is below one payload; "
@@ -182,6 +204,21 @@ def send_file(input_file, receiver_ip):
         details=f"rto={initial_rto:.6f} handshake_attempts={syn_attempts}"
     )
 
+    def log_cwnd(reason):
+        if controller is None:
+            return
+
+        phase = controller.phase
+        if phase is None:
+            phase = "unknown"
+        details = f"cwnd={controller.cwnd:.3f} reason={reason} phase={phase}"
+        ssthresh = controller.ssthresh
+        if ssthresh is not None:
+            details += f" ssthresh={ssthresh:.3f}"
+        logger.log("CWND_UPDATE", details=details)
+
+    log_cwnd("init")
+
     # Sliding Window transfer
     base = 0
     next_seq = 0
@@ -202,6 +239,11 @@ def send_file(input_file, receiver_ip):
     last_rwnd = syn_ack.rwnd
     in_flight_bytes = 0
 
+    # Outstanding bytes sent through Limited Transmit (RFC 3042); they are
+    # excluded from the FlightSize used for the ssthresh calculation.
+    limited_transmit_seqs = set()
+    limited_transmit_bytes = 0
+
     # Absolute deadline for the oldest unacknowledged packet.
     # Non-advancing ACKs may update RTO but must not move this deadline.
     rto_deadline = None
@@ -212,41 +254,52 @@ def send_file(input_file, receiver_ip):
 
     sock.settimeout(SOCKET_POLL_INTERVAL)
 
+    def transmit_next():
+        nonlocal next_seq, in_flight_bytes, rto_deadline
+
+        send_time = time.monotonic()
+        packet = Packet(
+            packet_type=DATA,
+            seq=next_seq,
+            payload=chunks[next_seq],
+            ts_send=encode_timestamp(send_time)
+        )
+
+        sock.sendto(packet.pack(), receiver_address)
+
+        outstanding[next_seq] = packet
+        retries[next_seq] = 0
+        in_flight_bytes += len(chunks[next_seq])
+
+        if next_seq == base:
+            rto_deadline = send_time + estimator.rto
+
+        logger.log(
+            "PACKET_SENT",
+            packet_type="DATA",
+            seq=next_seq,
+            byte_count=len(chunks[next_seq]),
+            attempt=1
+        )
+
+        print(f"Sent DATA packet {next_seq}")
+        next_seq += 1
+
     while base < total_packets:
 
-        # Bound new transmissions by the packet limit and advertised byte window.
+        # New transmissions are bounded by the congestion window (Reno),
+        # the packet cap, and the advertised byte window.  Without
+        # congestion control only the cap and the byte window apply.
+        if controller is None:
+            max_in_flight = WINDOW_SIZE
+        else:
+            max_in_flight = min(int(controller.cwnd), WINDOW_SIZE)
         while (
             next_seq < total_packets
-            and next_seq < base + WINDOW_SIZE
+            and next_seq < base + max_in_flight
             and in_flight_bytes + len(chunks[next_seq]) <= last_rwnd
         ):
-            send_time = time.monotonic()
-            packet = Packet(
-                packet_type=DATA,
-                seq=next_seq,
-                payload=chunks[next_seq],
-                ts_send=encode_timestamp(send_time)
-            )
-
-            sock.sendto(packet.pack(), receiver_address)
-
-            outstanding[next_seq] = packet
-            retries[next_seq] = 0
-            in_flight_bytes += len(chunks[next_seq])
-
-            if next_seq == base:
-                rto_deadline = send_time + estimator.rto
-
-            logger.log(
-                "PACKET_SENT",
-                packet_type="DATA",
-                seq=next_seq,
-                byte_count=len(chunks[next_seq]),
-                attempt=1
-            )
-
-            print(f"Sent DATA packet {next_seq}")
-            next_seq += 1
+            transmit_next()
 
 
         # Nothing is in flight and the next payload cannot fit the
@@ -271,7 +324,7 @@ def send_file(input_file, receiver_ip):
                 )
             )
             sock.close()
-            return
+            return False
 
 
         ack_packet, ack_arrival = receive_ack(sock, receiver_address)
@@ -352,6 +405,8 @@ def send_file(input_file, receiver_ip):
                         f"Window base: {base} -> {ack_number}"
                     )
 
+                    newly_acked_bytes = 0
+
                     # RTT sampling must happen BEFORE popping outstanding packets,
                     # since the echo identifies a specific outstanding packet.
                     if ack_packet.ts_echo:
@@ -392,7 +447,13 @@ def send_file(input_file, receiver_ip):
                                 )
 
                     for seq in range(base, ack_number):
+                        newly_acked_bytes += len(outstanding[seq].payload)
                         in_flight_bytes -= len(outstanding[seq].payload)
+                        if seq in limited_transmit_seqs:
+                            limited_transmit_seqs.discard(seq)
+                            limited_transmit_bytes -= len(
+                                outstanding[seq].payload
+                            )
                         outstanding.pop(seq, None)
                         retries.pop(seq, None)
                         sampled_seqs.discard(seq)
@@ -403,6 +464,10 @@ def send_file(input_file, receiver_ip):
 
                     if base < total_packets:
                         rto_deadline = ack_arrival + estimator.rto
+
+                    if controller is not None:
+                        controller.on_ack(newly_acked_bytes / smss)
+                    log_cwnd("ack")
 
                 elif ack_number == base and base < next_seq:
                     # Three duplicate ACKs trigger fast retransmission of the oldest missing packet.
@@ -445,6 +510,30 @@ def send_file(input_file, receiver_ip):
                         if rto_deadline is None:
                             rto_deadline = time.monotonic() + estimator.rto
 
+                        # RFC 5681 3.2: data sent through Limited Transmit
+                        # is excluded from the ssthresh FlightSize.
+                        if controller is not None:
+                            controller.on_loss(
+                                (in_flight_bytes - limited_transmit_bytes)
+                                / smss
+                            )
+                        log_cwnd("fast_recovery")
+
+                    elif (
+                        controller is not None
+                        and duplicate_acks <= 2
+                        and next_seq < total_packets
+                        and (next_seq - base)
+                        < min(int(controller.cwnd) + 2, WINDOW_SIZE)
+                        and in_flight_bytes + len(chunks[next_seq])
+                        <= last_rwnd
+                    ):
+                        # RFC 3042 limited transmit: one fresh segment per
+                        # early duplicate ACK, within cwnd + 2.
+                        transmit_next()
+                        limited_transmit_seqs.add(next_seq - 1)
+                        limited_transmit_bytes += len(chunks[next_seq - 1])
+
         # On timeout, retransmit only the oldest unacknowledged packet.
         # Apply exponential backoff and re-arm its deadline.
         if base < next_seq and rto_deadline is not None:
@@ -461,7 +550,7 @@ def send_file(input_file, receiver_ip):
                         details="Maximum retries exceeded"
                     )
                     sock.close()
-                    return
+                    return False
 
                 retries[base] += 1
                 attempt = retries[base] + 1
@@ -495,6 +584,12 @@ def send_file(input_file, receiver_ip):
                 rto_deadline = time.monotonic() + estimator.rto
                 base_retx_done = True
 
+                # The timeout FlightSize includes Limited Transmit data;
+                # base identifies the retransmitted segment.
+                if controller is not None:
+                    controller.on_timeout(in_flight_bytes / smss, base)
+                log_cwnd("timeout")
+
     print("\nAll DATA packets acknowledged.")
 
 
@@ -516,16 +611,18 @@ def send_file(input_file, receiver_ip):
             seq=total_packets,
             byte_count=total_bytes
         )
-    else:
-        print("FIN handshake failed.")
-        logger.log(
-            "TRANSFER_FAILED",
-            packet_type="FIN",
-            seq=total_packets,
-            details="FIN handshake failed"
-        )
+        sock.close()
+        return True
 
+    print("FIN handshake failed.")
+    logger.log(
+        "TRANSFER_FAILED",
+        packet_type="FIN",
+        seq=total_packets,
+        details="FIN handshake failed"
+    )
     sock.close()
+    return False
 
 
 if __name__ == "__main__":
@@ -533,4 +630,5 @@ if __name__ == "__main__":
         print("Usage: python -m transport.sender <input_file> <receiver_ip>")
         sys.exit(1)
 
-    send_file(sys.argv[1], sys.argv[2])
+    if not send_file(sys.argv[1], sys.argv[2]):
+        sys.exit(1)

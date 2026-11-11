@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""Phase 2 experiment helper: run a transport endpoint or a user-space
-lossy/reordering relay with isolated log paths.
+"""Run transport endpoints and a UDP relay for network experiments.
 
-Used by phase2_uspace_experiments.py (no root) and phase2_experiments.py
-(Mininet + netem).  Three roles: `receiver` and `sender` wrap the transport
-endpoints with explicit log paths; `relay` impairs the data path (loss,
-delay, reordering, optional mid-run delay change) and forwards ACKs back.
-See --help for each role's arguments.
-
-Never runs anything at import time; not collected by pytest.
+Provides receiver, sender and relay command-line roles.
 """
 
 import argparse
@@ -29,13 +22,10 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def _isolate_cwd():
-    """chdir to a scratch dir so module-level default loggers (which use
-    relative 'results/...' paths) never touch the repository."""
+    """Move to a temporary directory to isolate relative log paths."""
 
     os.chdir(tempfile.mkdtemp(prefix="phase2_node_"))
 
-
-#  roles
 
 
 def run_receiver(args):
@@ -61,11 +51,27 @@ def run_sender(args):
     _isolate_cwd()
 
     import transport.sender as sender_module
+    from transport.cc.reno import INITIAL_CWND, INITIAL_SSTHRESH, RenoController
     from transport.csv_logger import CSVLogger
 
     sender_module.PORT = args.port
     sender_module.logger = CSVLogger(args.log)
-    sender_module.send_file(args.file, args.host)
+
+    controller = None
+    if args.initial_cwnd is not None or args.initial_ssthresh is not None:
+        controller = RenoController(
+            initial_cwnd=(
+                INITIAL_CWND if args.initial_cwnd is None
+                else args.initial_cwnd
+            ),
+            ssthresh=(
+                INITIAL_SSTHRESH if args.initial_ssthresh is None
+                else args.initial_ssthresh
+            ),
+        )
+
+    if not sender_module.send_file(args.file, args.host, controller):
+        sys.exit(1)
 
 
 def _parse_address(text):
@@ -206,8 +212,6 @@ def run_relay(args):
     print("relay: stats written to", args.stats_file)
 
 
-#  argument parsing
-
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -227,6 +231,8 @@ def build_parser():
     sender.add_argument("host")
     sender.add_argument("port", type=int)
     sender.add_argument("log")
+    sender.add_argument("--initial-cwnd", type=float, default=None)
+    sender.add_argument("--initial-ssthresh", type=float, default=None)
     sender.set_defaults(func=run_sender)
 
     relay = sub.add_parser("relay")

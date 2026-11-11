@@ -164,7 +164,7 @@ def run_transfer(run_dir, size_bytes, relay_options, rwnd_bytes=None,
         "receiver_exit": receiver_exit,
         "timed_out": timed_out,
         "sha256_match": match,
-        "goodput_kbps": size_bytes / duration / 1000.0 if duration else 0.0,
+        "goodput_kbytes_per_s": size_bytes / duration / 1000.0 if duration else 0.0,
         "relay_options": " ".join(relay_options),
         "rwnd_bytes": rwnd_bytes,
         "port": port,
@@ -183,7 +183,7 @@ def _summary_lines(title, info):
         f"receiver exit: {info['receiver_exit']}, "
         f"timed out: {info['timed_out']}",
         f"Duration: {info['duration_s']:.2f} s",
-        f"Goodput: {info['goodput_kbps']:.1f} kB/s",
+        f"Goodput: {info['goodput_kbytes_per_s']:.1f} kB/s",
         f"SHA-256 match: {info['sha256_match']}",
     ]
 
@@ -271,11 +271,11 @@ def experiment_rwnd_small(results_root):
         [
             "Phase 2 experiment: small receiver window limiting throughput",
             f"Default rwnd run: {default['duration_s']:.2f} s, "
-            f"{default['goodput_kbps']:.1f} kB/s",
+            f"{default['goodput_kbytes_per_s']:.1f} kB/s",
             f"Small rwnd run:   {small['duration_s']:.2f} s, "
-            f"{small['goodput_kbps']:.1f} kB/s",
+            f"{small['goodput_kbytes_per_s']:.1f} kB/s",
             f"Throughput ratio (default / small): "
-            f"{default['goodput_kbps'] / small['goodput_kbps']:.2f}x",
+            f"{default['goodput_kbytes_per_s'] / small['goodput_kbytes_per_s']:.2f}x",
             f"SHA-256 match: default={default['sha256_match']}, "
             f"small={small['sha256_match']}",
         ],
