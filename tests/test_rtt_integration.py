@@ -17,7 +17,7 @@ from tests.helpers import SenderTestBase
 
 
 def parse_details(row):
-    """Parse 'key=value key=value' log details into a dict of floats."""
+    """Parse key-value details from a sender log row."""
     values = {}
     for token in row["details"].split():
         key, _, value = token.partition("=")
@@ -396,6 +396,10 @@ class BackoffCollapseTests(SenderTestBase):
             parse_details(backoffs[0])["rto"], 2.0, places=3
         )
         self.peer.send_ack(1)
+        # Post-timeout cwnd is 1, so the outstanding window 1..5 must
+        # drain before packet 6 can be sent.
+        for ack in range(2, 7):
+            self.peer.send_ack(ack)
         self.assertEqual(self.peer.collect_data(1, timeout=2.0), [6])
         self.peer.send_ack(7, ts_echo=self.peer.timestamps[6])
         samples = self.wait_for_event("RTT_SAMPLE", timeout=1.0)
