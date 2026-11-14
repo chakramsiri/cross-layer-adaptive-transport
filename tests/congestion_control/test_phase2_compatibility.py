@@ -1,4 +1,3 @@
-"""Tests for congestion-control defaults in the experiment CLI."""
 
 import csv
 import importlib.util
@@ -30,8 +29,6 @@ def _load_experiment_module():
 
 
 class Phase2NodeDefaultsTests(unittest.TestCase):
-    """Tests sender behavior with and without Reno configuration."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -193,6 +190,7 @@ class RunSenderPropagationTests(unittest.TestCase):
             file="input.bin", host="127.0.0.1", port=1,
             log=str(Path(self.tmp.name) / "sender.csv"),
             initial_cwnd=None, initial_ssthresh=None,
+            window_size=None,
         )
         try:
             self.node.run_sender(args)
