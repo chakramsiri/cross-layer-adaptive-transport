@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-"""Run transport endpoints and a UDP relay for network experiments.
-
-Provides receiver, sender and relay command-line roles.
-"""
+"""Run transport endpoints and a UDP relay for network experiments."""
 
 import argparse
 import heapq
@@ -57,6 +53,11 @@ def run_sender(args):
     sender_module.PORT = args.port
     sender_module.logger = CSVLogger(args.log)
 
+    if args.window_size is not None:
+        if args.window_size < 1:
+            sys.exit("phase2_node: --window-size must be at least 1")
+        sender_module.WINDOW_SIZE = args.window_size
+
     controller = None
     if args.initial_cwnd is not None or args.initial_ssthresh is not None:
         controller = RenoController(
@@ -80,19 +81,14 @@ def _parse_address(text):
 
 
 def run_relay(args):
-    """Single-socket UDP relay with seeded delay/loss/reordering.
-
-    Data path: sender -> relay -> forward address (the receiver).
-    Reverse path: receiver -> relay -> last sender address.
-    A mid-run delay change is applied once after --delay-change-after-s.
-    """
+    """Single-socket UDP relay with seeded delay, loss and reordering."""
 
     listen_addr = _parse_address(args.listen)
     forward_addr = _parse_address(args.forward)
 
     stop = {"flag": False}
 
-    def _handle_stop(signum, frame):  # noqa: ARG001
+    def _handle_stop(signum, frame):
         stop["flag"] = True
 
     signal.signal(signal.SIGTERM, _handle_stop)
@@ -176,7 +172,6 @@ def run_relay(args):
                 continue
 
             if addr == forward_addr:
-                # From the receiver; forward back to the sender.
                 counters["reverse_in"] += 1
                 if sender_addr is None:
                     continue
@@ -185,7 +180,6 @@ def run_relay(args):
                     continue
                 schedule(ack_delay_ms / 1000.0, sender_addr, data)
             else:
-                # From the sender; forward to the receiver with impairments.
                 sender_addr = addr
                 counters["forward_in"] += 1
                 delay = delay_ms / 1000.0
@@ -233,6 +227,15 @@ def build_parser():
     sender.add_argument("log")
     sender.add_argument("--initial-cwnd", type=float, default=None)
     sender.add_argument("--initial-ssthresh", type=float, default=None)
+    sender.add_argument(
+        "--window-size",
+        type=int,
+        default=None,
+        help=(
+            "experiment-only override of the sender's maximum packets "
+            "in flight; omitted keeps the transport default"
+        ),
+    )
     sender.set_defaults(func=run_sender)
 
     relay = sub.add_parser("relay")
