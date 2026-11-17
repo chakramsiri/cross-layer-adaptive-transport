@@ -1,6 +1,7 @@
 """Forwarder integration tests over real loopback UDP sockets."""
 
 import csv
+import json
 import socket
 import threading
 import tempfile
@@ -8,8 +9,10 @@ import time
 import unittest
 from pathlib import Path
 
-from router.forwarder import Forwarder, build_parser, main
+from router.forwarder import Forwarder, build_parser, build_queue, main
+from router.queues.codel import CoDel
 from router.queues.droptail import DropTail
+from router.queues.red import RED
 from router.telemetry import TelemetryLogger
 
 
@@ -42,7 +45,7 @@ class ForwarderFixture:
     """Starts a forwarder thread and guarantees teardown."""
 
     def __init__(self, test, rate_bps=5_000_000, capacity=64,
-                 with_receiver=True, telemetry=True):
+                 with_receiver=True, telemetry=True, queue=None):
         self.test = test
         self.tmp = Path(tempfile.mkdtemp(prefix="fwd_test_"))
         self.receiver = None
@@ -64,7 +67,7 @@ class ForwarderFixture:
             receiver_face=("127.0.0.1", 0),
             receiver_target=target,
             rate_bps=rate_bps,
-            queue=DropTail(capacity),
+            queue=queue if queue is not None else DropTail(capacity),
             telemetry=telemetry_logger,
         )
         self.thread = threading.Thread(
@@ -428,6 +431,382 @@ class TestConfiguration(unittest.TestCase):
             ]
         )
         self.assertEqual(exit_code, 1)
+
+
+def read_events(path):
+    with open(path, newline="") as file:
+        return list(csv.DictReader(file))
+
+
+def wait_until(condition, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestAqmSelection(unittest.TestCase):
+    def _argv(self, telemetry, *extra):
+        return [
+            "--sender-face", "127.0.0.1:0",
+            "--receiver-face", "127.0.0.1:0",
+            "--receiver", "127.0.0.1:5999",
+            "--rate-mbps", "5",
+            "--queue-capacity", "200",
+            "--telemetry", str(telemetry),
+            *extra,
+        ]
+
+    def test_default_aqm_is_droptail(self):
+        args = build_parser().parse_args(self._argv("t.csv"))
+
+        self.assertEqual(args.aqm, "droptail")
+        self.assertEqual(args.aqm_mode, "drop")
+
+        queue = build_queue(args)
+        self.assertIsInstance(queue, DropTail)
+        self.assertEqual(queue.capacity, 200)
+
+    def test_red_selection_plumbs_parameters(self):
+        args = build_parser().parse_args(
+            self._argv(
+                "t.csv",
+                "--aqm", "red",
+                "--red-w-q", "0.002",
+                "--red-min-th", "20",
+                "--red-max-th", "80",
+                "--red-max-p", "0.1",
+                "--red-seed", "42",
+            )
+        )
+
+        queue = build_queue(args)
+        self.assertIsInstance(queue, RED)
+        self.assertEqual(
+            queue.parameters,
+            {
+                "w_q": 0.002,
+                "min_th": 20.0,
+                "max_th": 80.0,
+                "max_p": 0.1,
+                "gentle": False,
+                "mode": "drop",
+                "seed": 42,
+                "typical_packet_bytes": 1029.0,
+                "rate_bps": 625_000.0,
+                "typical_tx_ms": 1029.0 / 625_000.0 * 1000.0,
+            },
+        )
+
+    def test_red_packet_size_and_rate_propagated(self):
+        args = build_parser().parse_args(
+            self._argv(
+                "t.csv",
+                "--aqm", "red",
+                "--rate-mbps", "2",
+                "--red-typical-packet-bytes", "1200",
+            )
+        )
+
+        parameters = build_queue(args).parameters
+
+        self.assertEqual(parameters["rate_bps"], 250_000.0)
+        self.assertEqual(parameters["typical_packet_bytes"], 1200.0)
+        self.assertAlmostEqual(
+            parameters["typical_tx_ms"], 1200.0 / 250_000.0 * 1000.0
+        )
+
+    def test_red_mark_and_gentle_plumbed(self):
+        args = build_parser().parse_args(
+            self._argv(
+                "t.csv",
+                "--aqm", "red",
+                "--aqm-mode", "mark",
+                "--red-gentle",
+            )
+        )
+
+        queue = build_queue(args)
+        self.assertEqual(queue.parameters["mode"], "mark")
+        self.assertTrue(queue.parameters["gentle"])
+
+    def test_codel_selection_converts_milliseconds(self):
+        args = build_parser().parse_args(
+            self._argv("t.csv", "--aqm", "codel")
+        )
+
+        queue = build_queue(args)
+        self.assertIsInstance(queue, CoDel)
+        self.assertEqual(queue.parameters["target_ms"], 5.0)
+        self.assertEqual(queue.parameters["interval_ms"], 100.0)
+        self.assertEqual(queue.parameters["mode"], "drop")
+
+    def test_droptail_rejects_mark_mode(self):
+        args = build_parser().parse_args(
+            self._argv("t.csv", "--aqm", "droptail", "--aqm-mode", "mark")
+        )
+
+        with self.assertRaises(ValueError):
+            build_queue(args)
+
+    def test_main_rejects_droptail_mark_mode(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fwd_aqm_"))
+        exit_code = main(
+            self._argv(
+                tmp / "t.csv",
+                "--aqm", "droptail",
+                "--aqm-mode", "mark",
+                "--max-seconds", "0.2",
+            )
+        )
+
+        self.assertEqual(exit_code, 1)
+
+    def test_main_rejects_invalid_red_parameters_before_forwarding(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fwd_aqm_"))
+        exit_code = main(
+            self._argv(
+                tmp / "t.csv",
+                "--aqm", "red",
+                "--red-w-q", "0",
+                "--max-seconds", "0.2",
+            )
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse((tmp / "router_telemetry.csv").exists())
+
+    def test_main_rejects_red_thresholds_above_capacity(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fwd_aqm_"))
+        exit_code = main(
+            [
+                "--sender-face", "127.0.0.1:0",
+                "--receiver-face", "127.0.0.1:0",
+                "--receiver", "127.0.0.1:5999",
+                "--rate-mbps", "5",
+                "--queue-capacity", "50",
+                "--aqm", "red",
+                "--telemetry", str(tmp / "t.csv"),
+                "--max-seconds", "0.2",
+            ]
+        )
+
+        self.assertEqual(exit_code, 1)
+
+    def test_main_rejects_invalid_codel_interval(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fwd_aqm_"))
+        exit_code = main(
+            self._argv(
+                tmp / "t.csv",
+                "--aqm", "codel",
+                "--codel-target-ms", "5",
+                "--codel-interval-ms", "5",
+                "--max-seconds", "0.2",
+            )
+        )
+
+        self.assertEqual(exit_code, 1)
+
+    def test_router_metadata_written_beside_telemetry(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fwd_aqm_"))
+        exit_code = main(
+            [
+                "--sender-face", "127.0.0.1:0",
+                "--receiver-face", "127.0.0.1:0",
+                "--receiver", "127.0.0.1:5999",
+                "--rate-mbps", "1",
+                "--queue-capacity", "100",
+                "--aqm", "red",
+                "--red-min-th", "10",
+                "--red-max-th", "40",
+                "--red-seed", "7",
+                "--telemetry", str(tmp / "router_telemetry.csv"),
+                "--max-seconds", "0.3",
+            ]
+        )
+
+        self.assertEqual(exit_code, 0)
+        metadata = json.loads((tmp / "router_metadata.json").read_text())
+        self.assertEqual(metadata["algorithm"], "red")
+        self.assertEqual(metadata["mode"], "drop")
+        self.assertEqual(metadata["queue_capacity"], 100)
+        self.assertEqual(metadata["rate_mbps"], 1.0)
+        self.assertEqual(metadata["parameters"]["min_th"], 10.0)
+        self.assertEqual(metadata["parameters"]["max_th"], 40.0)
+        self.assertEqual(metadata["parameters"]["seed"], 7)
+        self.assertEqual(metadata["parameters"]["rate_bps"], 125_000.0)
+        self.assertEqual(
+            metadata["parameters"]["typical_packet_bytes"], 1029.0
+        )
+        self.assertEqual(metadata["telemetry"], str(tmp / "router_telemetry.csv"))
+        self.assertIn("pid", metadata)
+        self.assertIn("started_at", metadata)
+
+
+class TestRedIntegration(unittest.TestCase):
+    def test_mark_mode_marks_without_dropping(self):
+        queue = RED(
+            capacity=64, w_q=1.0, min_th=1.0, max_th=2.0, max_p=1.0,
+            mode="mark",
+        )
+        fixture = ForwarderFixture(
+            self, rate_bps=50_000, capacity=64, queue=queue
+        )
+        count = 20
+
+        for index in range(count):
+            fixture.sender.sendto(bytes([index]) * 1000,
+                                  fixture.sender_face)
+
+        counters = fixture.forwarder.counters
+        self.assertTrue(
+            wait_until(lambda: counters["forwarded"] >= count)
+        )
+
+        self.assertEqual(counters["dropped"], 0)
+        self.assertGreaterEqual(counters["marks"], 5)
+        self.assertEqual(counters["forwarded"], count)
+        received = recv_all(fixture.receiver, count, timeout=10.0)
+        self.assertEqual(len(received), count)
+
+        fixture.forwarder.stop()
+        fixture.thread.join(timeout=5.0)
+        rows = read_events(fixture.tmp / "router_telemetry.csv")
+        marks = [row for row in rows if row["event"] == "mark"]
+        self.assertEqual(len(marks), counters["marks"])
+        self.assertTrue(all(row["reason"] == "red" for row in marks))
+        self.assertFalse(any(row["event"] == "drop" for row in rows))
+
+    def test_drop_mode_drops_are_counted_exactly_once(self):
+        queue = RED(
+            capacity=64, w_q=1.0, min_th=1.0, max_th=2.0, max_p=1.0,
+            mode="drop",
+        )
+        fixture = ForwarderFixture(
+            self, rate_bps=50_000, capacity=64, queue=queue
+        )
+        count = 20
+
+        for index in range(count):
+            fixture.sender.sendto(bytes([index]) * 1000,
+                                  fixture.sender_face)
+
+        counters = fixture.forwarder.counters
+        self.assertTrue(
+            wait_until(
+                lambda: counters["forwarded"] + counters["dropped"]
+                >= count
+                and counters["forwarded"] >= counters["accepted"]
+            )
+        )
+
+        self.assertGreaterEqual(counters["dropped"], 5)
+        self.assertEqual(
+            counters["accepted"] + counters["dropped"], count
+        )
+        self.assertEqual(counters["forwarded"], counters["accepted"])
+        received = recv_all(fixture.receiver, counters["accepted"],
+                            timeout=10.0)
+        self.assertEqual(len(received), counters["accepted"])
+
+        fixture.forwarder.stop()
+        fixture.thread.join(timeout=5.0)
+        rows = read_events(fixture.tmp / "router_telemetry.csv")
+        drops = [row for row in rows if row["event"] == "drop"]
+        self.assertEqual(len(drops), counters["dropped"])
+        self.assertTrue(all(row["reason"] == "red" for row in drops))
+        self.assertTrue(all(row["sojourn_ms"] == "" for row in drops))
+        self.assertEqual(counters["marks"], 0)
+
+
+class TestCoDelIntegration(unittest.TestCase):
+    def _run_flood(self, mode):
+        queue = CoDel(
+            capacity=64,
+            target_seconds=0.005,
+            interval_seconds=0.02,
+            mode=mode,
+        )
+        fixture = ForwarderFixture(
+            self, rate_bps=100_000, capacity=64, queue=queue
+        )
+        count = 30
+
+        for index in range(count):
+            fixture.sender.sendto(bytes([index]) * 1000,
+                                  fixture.sender_face)
+
+        counters = fixture.forwarder.counters
+        self.assertTrue(
+            wait_until(
+                lambda: counters["forwarded"] + counters["dropped"]
+                >= count,
+                timeout=20.0,
+            )
+        )
+        fixture.forwarder.stop()
+        fixture.thread.join(timeout=5.0)
+        rows = read_events(fixture.tmp / "router_telemetry.csv")
+        return fixture, counters, rows, count
+
+    def test_drop_mode_dequeue_drops_reach_telemetry(self):
+        fixture, counters, rows, count = self._run_flood("drop")
+
+        self.assertEqual(counters["accepted"], count)
+        self.assertEqual(
+            counters["forwarded"] + counters["dropped"], count
+        )
+        self.assertGreaterEqual(counters["dropped"], 1)
+        self.assertEqual(counters["marks"], 0)
+
+        drops = [row for row in rows if row["event"] == "drop"]
+        forwards = [row for row in rows if row["event"] == "forward"]
+        self.assertEqual(len(drops), counters["dropped"])
+        self.assertEqual(len(forwards), counters["forwarded"])
+        self.assertTrue(all(row["reason"] == "codel" for row in drops))
+        self.assertTrue(all(row["sojourn_ms"] != "" for row in drops))
+
+        received = recv_all(fixture.receiver, counters["forwarded"],
+                            timeout=10.0)
+        self.assertEqual(len(received), counters["forwarded"])
+
+    def test_mark_mode_records_signals_and_forwards_everything(self):
+        fixture, counters, rows, count = self._run_flood("mark")
+
+        self.assertEqual(counters["accepted"], count)
+        self.assertEqual(counters["forwarded"], count)
+        self.assertEqual(counters["dropped"], 0)
+        self.assertGreaterEqual(counters["marks"], 1)
+
+        marks = [row for row in rows if row["event"] == "mark"]
+        self.assertEqual(len(marks), counters["marks"])
+        self.assertTrue(all(row["reason"] == "codel" for row in marks))
+        self.assertFalse(any(row["event"] == "drop" for row in rows))
+
+        received = recv_all(fixture.receiver, count, timeout=10.0)
+        self.assertEqual(len(received), count)
+
+
+class TestAqmReversePath(unittest.TestCase):
+    def test_acks_relayed_while_red_queue_saturated(self):
+        queue = RED(
+            capacity=2, w_q=1.0, min_th=1.0, max_th=2.0, max_p=1.0,
+            mode="drop",
+        )
+        fixture = ForwarderFixture(
+            self, rate_bps=20_000, capacity=2, queue=queue
+        )
+
+        for index in range(30):
+            fixture.sender.sendto(bytes([index]) * 2000,
+                                  fixture.sender_face)
+
+        fixture.receiver.sendto(b"ACK-now", fixture.receiver_face)
+        data, _addr = recv_all(fixture.sender, 1, timeout=2.0)[0]
+
+        self.assertEqual(data, b"ACK-now")
 
 
 if __name__ == "__main__":
