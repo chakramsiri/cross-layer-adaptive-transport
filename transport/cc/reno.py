@@ -20,6 +20,8 @@ class RenoController(CongestionController):
     purely loss-based.
     """
 
+    name = "reno"
+
     def __init__(self, initial_cwnd=INITIAL_CWND, ssthresh=INITIAL_SSTHRESH):
         if not math.isfinite(initial_cwnd) or initial_cwnd < 1:
             raise ValueError("initial_cwnd must be finite and at least 1")

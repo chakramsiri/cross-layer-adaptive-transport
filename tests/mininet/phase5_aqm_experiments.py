@@ -251,6 +251,7 @@ def build_run_metadata(args, plan, run_dir, aqm, input_sha256, parameters):
             "window_size": args.sender_window,
             "initial_ssthresh": args.initial_ssthresh,
         },
+        "congestion_control": phase4.controller_parameters(args),
         "receiver": {"rwnd_bytes": args.rwnd_bytes},
         "address_plan": {
             name: phase4.format_address(address)
@@ -347,6 +348,30 @@ def build_arg_parser():
         type=float,
         default=20.0,
         help="sender initial ssthresh for the bulk runs",
+    )
+    parser.add_argument(
+        "--cc-mode",
+        choices=("reno", "dctcp", "delay"),
+        default="reno",
+        help="sender congestion controller: reno (A), dctcp (B), delay (C)",
+    )
+    parser.add_argument(
+        "--dctcp-g",
+        type=float,
+        default=0.25,
+        help="Mode B alpha gain g (dctcp only)",
+    )
+    parser.add_argument(
+        "--delay-target-ms",
+        type=float,
+        default=5.0,
+        help="Mode C target queueing delay in milliseconds (delay only)",
+    )
+    parser.add_argument(
+        "--delay-increase-step",
+        type=float,
+        default=1.0,
+        help="Mode C additive increase per RTT in packets (delay only)",
     )
     parser.add_argument(
         "--rwnd-bytes",
@@ -456,6 +481,12 @@ def validate_args(args):
         raise SystemExit("error: --rwnd-bytes must be at least 1")
     if args.timeout_s < 10:
         raise SystemExit("error: --timeout-s must be at least 10")
+    if not 0.0 < args.dctcp_g <= 1.0:
+        raise SystemExit("error: --dctcp-g must be in (0, 1]")
+    if args.delay_target_ms <= 0.0:
+        raise SystemExit("error: --delay-target-ms must be positive")
+    if args.delay_increase_step <= 0.0:
+        raise SystemExit("error: --delay-increase-step must be positive")
     if args.interactive and args.topology != "mininet":
         raise SystemExit(
             "error: --interactive requires the Mininet topology "
@@ -524,12 +555,16 @@ def build_manual_endpoint_commands(args, plan, run_dir, interfaces):
         f"</dev/null > {run_dir}/manual_receiver_stdout.log 2>&1 "
         f"& echo $! > {run_dir}/receiver.pid",
     ]
+    controller_flags = "".join(
+        f"{flag} " for flag in phase4.controller_options(args)
+    )
     sender = [
         f"mininet> h1 python3 -u {NODE} sender {run_dir}/input.bin "
         f"{plan['sender_target'][0]} {plan['sender_target'][1]} "
         f"{run_dir}/manual_sender_log.csv "
         f"--window-size {args.sender_window} "
         f"--initial-ssthresh {args.initial_ssthresh} "
+        f"{controller_flags}"
         f"</dev/null > {run_dir}/manual_sender_stdout.log 2>&1 "
         f"& echo $! > {run_dir}/sender.pid",
     ]
@@ -783,6 +818,7 @@ def build_summary(args, plan, results, input_bytes, input_sha):
     summary = {
         "topology": args.topology,
         "aqm_mode": args.aqm_mode,
+        "congestion_control": phase4.controller_parameters(args),
         "configuration": {
             "rate_mbps": args.rate_mbps,
             "access_link_delay_ms": args.delay_ms,

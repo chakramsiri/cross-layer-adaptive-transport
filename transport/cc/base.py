@@ -12,6 +12,8 @@ class CongestionController(ABC):
     and never inspects controller internals.
     """
 
+    name = "custom"
+
     @property
     @abstractmethod
     def cwnd(self):

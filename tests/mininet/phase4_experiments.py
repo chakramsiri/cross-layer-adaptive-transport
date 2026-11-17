@@ -456,6 +456,38 @@ def parse_run_selection(text):
     return selected
 
 
+def controller_parameters(args):
+    """Congestion-control mode and its parameters as recorded in evidence."""
+    mode = getattr(args, "cc_mode", None)
+    if mode == "dctcp":
+        return {"mode": mode, "parameters": {"g": args.dctcp_g}}
+    if mode == "delay":
+        return {
+            "mode": mode,
+            "parameters": {
+                "target_ms": args.delay_target_ms,
+                "increase_step": args.delay_increase_step,
+            },
+        }
+    return {"mode": mode, "parameters": {}}
+
+
+def controller_options(args):
+    """Sender CLI options that select and tune the congestion controller."""
+    mode = getattr(args, "cc_mode", None)
+    if mode is None:
+        return []
+    if mode == "dctcp":
+        return ["--cc-mode", mode, "--dctcp-g", str(args.dctcp_g)]
+    if mode == "delay":
+        return [
+            "--cc-mode", mode,
+            "--delay-target-ms", str(args.delay_target_ms),
+            "--delay-increase-step", str(args.delay_increase_step),
+        ]
+    return ["--cc-mode", mode]
+
+
 def sender_options(args, bulk):
     """Sender CLI options; bulk runs raise the in-flight cap."""
     if not bulk:
@@ -464,6 +496,7 @@ def sender_options(args, bulk):
     return [
         "--window-size", str(args.sender_window),
         "--initial-ssthresh", str(args.initial_ssthresh),
+        *controller_options(args),
     ]
 
 
