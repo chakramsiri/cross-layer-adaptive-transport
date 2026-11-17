@@ -43,11 +43,51 @@ def run_receiver(args):
     receiver_module.receive_file(args.output)
 
 
+def build_sender_controller(args):
+    """Controller selected by the sender flags, or None when congestion
+    control stays disabled (no mode and no window flags given)."""
+
+    from transport.cc.factory import make_controller
+    from transport.cc.reno import INITIAL_CWND, INITIAL_SSTHRESH
+
+    cc_mode = getattr(args, "cc_mode", None)
+    dctcp_g = getattr(args, "dctcp_g", None)
+    delay_target_ms = getattr(args, "delay_target_ms", None)
+    delay_increase_step = getattr(args, "delay_increase_step", None)
+
+    params = {}
+    if dctcp_g is not None:
+        params["g"] = dctcp_g
+    if delay_target_ms is not None:
+        params["target_seconds"] = delay_target_ms / 1000.0
+    if delay_increase_step is not None:
+        params["increase_step"] = delay_increase_step
+
+    if (
+        cc_mode is None
+        and args.initial_cwnd is None
+        and args.initial_ssthresh is None
+        and not params
+    ):
+        return None
+
+    return make_controller(
+        cc_mode or "reno",
+        initial_cwnd=(
+            INITIAL_CWND if args.initial_cwnd is None else args.initial_cwnd
+        ),
+        ssthresh=(
+            INITIAL_SSTHRESH if args.initial_ssthresh is None
+            else args.initial_ssthresh
+        ),
+        **params,
+    )
+
+
 def run_sender(args):
     _isolate_cwd()
 
     import transport.sender as sender_module
-    from transport.cc.reno import INITIAL_CWND, INITIAL_SSTHRESH, RenoController
     from transport.csv_logger import CSVLogger
 
     sender_module.PORT = args.port
@@ -58,18 +98,7 @@ def run_sender(args):
             sys.exit("phase2_node: --window-size must be at least 1")
         sender_module.WINDOW_SIZE = args.window_size
 
-    controller = None
-    if args.initial_cwnd is not None or args.initial_ssthresh is not None:
-        controller = RenoController(
-            initial_cwnd=(
-                INITIAL_CWND if args.initial_cwnd is None
-                else args.initial_cwnd
-            ),
-            ssthresh=(
-                INITIAL_SSTHRESH if args.initial_ssthresh is None
-                else args.initial_ssthresh
-            ),
-        )
+    controller = build_sender_controller(args)
 
     if not sender_module.send_file(args.file, args.host, controller):
         sys.exit(1)
@@ -227,6 +256,30 @@ def build_parser():
     sender.add_argument("log")
     sender.add_argument("--initial-cwnd", type=float, default=None)
     sender.add_argument("--initial-ssthresh", type=float, default=None)
+    sender.add_argument(
+        "--cc-mode",
+        choices=("reno", "dctcp", "delay"),
+        default=None,
+        help="congestion controller: reno (A), dctcp (B), delay (C)",
+    )
+    sender.add_argument(
+        "--dctcp-g",
+        type=float,
+        default=None,
+        help="Mode B alpha gain g in (0, 1] (dctcp only)",
+    )
+    sender.add_argument(
+        "--delay-target-ms",
+        type=float,
+        default=None,
+        help="Mode C target queueing delay in milliseconds (delay only)",
+    )
+    sender.add_argument(
+        "--delay-increase-step",
+        type=float,
+        default=None,
+        help="Mode C additive increase per RTT in packets (delay only)",
+    )
     sender.add_argument(
         "--window-size",
         type=int,

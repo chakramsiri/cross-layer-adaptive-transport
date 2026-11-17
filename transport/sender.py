@@ -238,6 +238,11 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
         if controller is not None:
             controller.on_feedback(step, feedback.q_delay_us / 1_000_000)
 
+    logger.log(
+        "CC_MODE",
+        details=f"mode={controller.name if controller is not None else 'none'}"
+    )
+
     log_cwnd("init")
 
     # Sliding Window transfer
