@@ -449,11 +449,6 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
                     for seq in range(base, ack_number):
                         newly_acked_bytes += len(outstanding[seq].payload)
                         in_flight_bytes -= len(outstanding[seq].payload)
-                        if seq in limited_transmit_seqs:
-                            limited_transmit_seqs.discard(seq)
-                            limited_transmit_bytes -= len(
-                                outstanding[seq].payload
-                            )
                         outstanding.pop(seq, None)
                         retries.pop(seq, None)
                         sampled_seqs.discard(seq)
@@ -461,6 +456,9 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
                     base = ack_number
                     duplicate_acks = 0
                     base_retx_done = False
+
+                    limited_transmit_seqs = set()
+                    limited_transmit_bytes = 0
 
                     if base < total_packets:
                         rto_deadline = ack_arrival + estimator.rto
@@ -589,6 +587,9 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
                 if controller is not None:
                     controller.on_timeout(in_flight_bytes / smss, base)
                 log_cwnd("timeout")
+
+                limited_transmit_seqs = set()
+                limited_transmit_bytes = 0
 
     print("\nAll DATA packets acknowledged.")
 

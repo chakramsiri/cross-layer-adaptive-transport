@@ -138,5 +138,79 @@ class TestTelemetryClose(unittest.TestCase):
         self.assertEqual(len(read_rows(path)), 1)
 
 
+class TestTelemetrySchemaExtension(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="telemetry_ext_"))
+        self.path = self.tmp / "router_telemetry.csv"
+
+    def test_new_columns_are_appended_to_the_schema(self):
+        self.assertEqual(FIELDS[-2:], ["avg_queue_packets", "reason"])
+
+    def test_new_columns_empty_where_not_applicable(self):
+        logger = TelemetryLogger(self.path)
+        logger.record("enqueue", 1, 1029, 0, 0, 0)
+        logger.record("drop", 2, 1029, 1, 0, 0)
+        logger.close()
+
+        for row in read_rows(self.path):
+            self.assertEqual(row["avg_queue_packets"], "")
+            self.assertEqual(row["reason"], "")
+
+    def test_mark_event_with_reason_recorded(self):
+        logger = TelemetryLogger(self.path)
+        logger.record("mark", 3, 1029, 0, 1, 0, reason="red",
+                      avg_queue=1.265625)
+        logger.close()
+
+        row = read_rows(self.path)[0]
+        self.assertEqual(row["event"], "mark")
+        self.assertEqual(row["reason"], "red")
+        self.assertEqual(row["avg_queue_packets"], "1.266")
+
+    def test_drop_reason_recorded(self):
+        logger = TelemetryLogger(self.path)
+        logger.record("drop", 3, 1029, 1, 0, 0, reason="codel",
+                      sojourn_seconds=0.012)
+        logger.record("drop", 3, 1029, 2, 0, 0, reason="full")
+        logger.close()
+
+        rows = read_rows(self.path)
+        self.assertEqual(rows[0]["reason"], "codel")
+        self.assertEqual(rows[0]["sojourn_ms"], "12.000")
+        self.assertEqual(rows[1]["reason"], "full")
+
+    def test_unknown_reason_rejected(self):
+        logger = TelemetryLogger(self.path)
+
+        with self.assertRaises(ValueError):
+            logger.record("drop", 0, 0, 1, 0, 0, reason="bogus")
+
+        logger.close()
+
+    def test_phase4_schema_rows_remain_readable(self):
+        legacy = self.tmp / "phase4_router_telemetry.csv"
+        legacy_fields = [
+            "elapsed_s", "event", "queue_length_packets", "sojourn_ms",
+            "drops", "marks", "bytes", "forwarded_bytes",
+        ]
+        with open(legacy, "w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=legacy_fields)
+            writer.writeheader()
+            writer.writerow({
+                "elapsed_s": "0.100000", "event": "forward",
+                "queue_length_packets": "2", "sojourn_ms": "4.000",
+                "drops": "1", "marks": "0", "bytes": "1029",
+                "forwarded_bytes": "1029",
+            })
+
+        with open(legacy, newline="") as file:
+            row = next(csv.DictReader(file))
+
+        self.assertEqual(row["event"], "forward")
+        self.assertEqual(row["sojourn_ms"], "4.000")
+        self.assertIsNone(row.get("avg_queue_packets"))
+        self.assertIsNone(row.get("reason"))
+
+
 if __name__ == "__main__":
     unittest.main()

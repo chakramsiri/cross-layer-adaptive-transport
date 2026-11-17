@@ -235,7 +235,7 @@ class FastRecoveryIntegrationTests(CwndTrackingMixin, SenderTestBase):
         self.assertIsNotNone(retransmission, "no second fast retransmit")
         self.assertEqual(retransmission.seq, 1)
 
-        # FlightSize is the outstanding data (packets 1..7), not cwnd.
+
         values = self.wait_for_cwnd("fast_recovery", 3.5)
         self.assertAlmostEqual(values["ssthresh"], 3.5)
         self.assertAlmostEqual(self.controller.cwnd, 3.5)
@@ -1006,6 +1006,280 @@ class FlightSizePropagationTests(CwndTrackingMixin, SenderTestBase):
         self.peer.send_ack(1)
         self.peer.send_ack(6)
         self.assertEqual(self.peer.collect_data(2, timeout=2.0), [6, 7])
+        self.finish_transfer()
+
+
+class StaleLimitedTransmitExclusionTests(CwndTrackingMixin, SenderTestBase):
+    """The limited-transmit exclusion is scoped to one loss event (RFC
+    5681 3.2 step 2); the next event counts all outstanding data."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(12)]
+    INITIAL_CWND = 8
+
+    def test_second_loss_event_counts_previous_limited_transmit_segments(
+        self,
+    ):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        values = self.wait_for_cwnd("fast_recovery", 4.0)
+        self.assertAlmostEqual(values["ssthresh"], 4.0)
+
+        self.peer.send_ack(1)
+        self.wait_for_cwnd("ack", 4.25)
+
+        for _ in range(3):
+            self.peer.send_ack(1)
+        retransmission = self.peer.recv_data(timeout=0.5)
+        self.assertIsNotNone(retransmission)
+        self.assertEqual(retransmission.seq, 1)
+
+        values = self.wait_for_cwnd("fast_recovery", 4.5)
+        self.assertAlmostEqual(values["ssthresh"], 4.5)
+        self.assertAlmostEqual(self.controller.cwnd, 4.5)
+
+        self.peer.send_ack(9)
+        self.assertEqual(self.peer.collect_data(2, timeout=2.0), [10, 11])
+        self.finish_transfer()
+
+    def test_exclusion_survives_only_within_one_event(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.wait_for_cwnd("fast_recovery", 4.0)
+
+        self.peer.send_ack(1)
+        self.wait_for_cwnd("ack", 4.25)
+
+        self.assertEqual(len(self.retransmissions("fast")), 1)
+        self.assertAlmostEqual(self.controller.cwnd, 4.25)
+
+        self.peer.send_ack(9)
+        self.assertEqual(self.peer.collect_data(2, timeout=2.0), [10, 11])
+        self.finish_transfer()
+
+
+class TimeoutThenFastRetransmitTests(CwndTrackingMixin, SenderTestBase):
+    """Timeout then fast retransmit in close succession: stale duplicate
+    ACKs are inert, and the later event uses the corrected FlightSize."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(12)]
+    INITIAL_CWND = 8
+
+    def test_stale_duplicate_acks_after_a_timeout_are_inert(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+
+        timed = self.peer.recv_data(timeout=1.8)
+        self.assertIsNotNone(timed, "no timeout retransmission")
+        self.assertEqual(timed.seq, 0)
+
+        values = self.wait_for_cwnd("timeout", 1.0)
+        self.assertAlmostEqual(values["ssthresh"], 5.0)
+        self.assertEqual(len(self.events("RTO_BACKOFF")), 1)
+
+        self.peer.send_ack(0)
+        self.assertIsNone(
+            self.peer.expect_no_data(0.3),
+            "fast retransmit after a timeout",
+        )
+        self.assertIsNone(
+            self.peer.expect_no_data(0.3),
+            "limited transmit after a timeout",
+        )
+        self.assertEqual(len(self.retransmissions("fast")), 0)
+        self.assertEqual(len(self.retransmissions("timeout")), 1)
+
+        self.peer.send_ack(1)
+        self.wait_for_cwnd("ack", 2.0)
+
+        for _ in range(3):
+            self.peer.send_ack(1)
+        retransmission = self.peer.recv_data(timeout=0.5)
+        self.assertIsNotNone(retransmission)
+        self.assertEqual(retransmission.seq, 1)
+
+        values = self.wait_for_cwnd("fast_recovery", 4.5)
+        self.assertAlmostEqual(values["ssthresh"], 4.5)
+        self.assertAlmostEqual(self.controller.cwnd, 4.5)
+
+        self.peer.send_ack(9)
+        self.assertEqual(self.peer.collect_data(2, timeout=2.0), [10, 11])
+        self.finish_transfer()
+
+
+class PartialAckClassicRenoTests(CwndTrackingMixin, SenderTestBase):
+    """Classic Reno (RFC 6582 distinguishes NewReno): a partial ACK exits
+    recovery without retransmitting; the hole waits for the timeout."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(8)]
+    INITIAL_CWND = 8
+
+    def test_partial_ack_exits_recovery_and_leaves_the_hole_to_the_timer(
+        self,
+    ):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        for _ in range(3):
+            self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.wait_for_cwnd("fast_recovery", 4.0)
+
+        self.peer.send_ack(4)
+        self.wait_for_cwnd("ack", 4.25)
+        self.assertFalse(self.controller.in_fast_recovery)
+        self.assertIsNone(
+            self.peer.expect_no_data(0.3),
+            "NewReno-style retransmission on a partial ACK",
+        )
+
+        timed = self.peer.recv_data(timeout=1.8)
+        self.assertIsNotNone(timed, "no timeout retransmission")
+        self.assertEqual(timed.seq, 4)
+        values = self.wait_for_cwnd("timeout", 1.0)
+        self.assertAlmostEqual(values["ssthresh"], 2.0)
+        self.assertEqual(len(self.retransmissions("fast")), 1)
+        self.assertEqual(len(self.retransmissions("timeout")), 1)
+
+        self.finish_transfer()
+
+
+class SmssRwndSeparationTests(CwndTrackingMixin, SenderTestBase):
+    """SMSS stays the segment size; a mid-transfer advertised-window
+    update never redefines the ACK growth unit (RFC 5681 section 2)."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(8)]
+    INITIAL_CWND = 4
+
+    def test_window_update_does_not_change_the_ack_growth_unit(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(4), [0, 1, 2, 3])
+
+        self.peer.send_ack(1, rwnd=700)
+        self.wait_for_cwnd("ack", 5.0)
+        self.assertAlmostEqual(self.controller.cwnd, 5.0)
+
+        self.peer.send_ack(2, rwnd=64000)
+        self.wait_for_cwnd("ack", 6.0)
+        self.assertEqual(
+            self.peer.collect_data(4, timeout=2.0), [4, 5, 6, 7]
+        )
+
+        self.finish_transfer()
+
+
+class MidTransferZeroWindowTests(CwndTrackingMixin, SenderTestBase):
+    """A zero advertised window blocks new data and limited transmit;
+    retransmissions proceed and progress resumes on reopen."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(8)]
+    INITIAL_CWND = 4
+
+    def test_zero_window_blocks_new_data_and_limited_transmit(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(4), [0, 1, 2, 3])
+
+        self.peer.send_ack(1, rwnd=0)
+        self.wait_for_cwnd("ack", 5.0)
+        self.assertIsNone(
+            self.peer.expect_no_data(0.3), "sent into a zero window"
+        )
+
+        for _ in range(2):
+            self.peer.send_ack(1)
+        self.assertIsNone(
+            self.peer.expect_no_data(0.3),
+            "limited transmit into a zero window",
+        )
+
+        self.peer.send_ack(1)
+        retransmission = self.peer.recv_data(timeout=0.5)
+        self.assertIsNotNone(retransmission, "no fast retransmit")
+        self.assertEqual(retransmission.seq, 1)
+        values = self.wait_for_cwnd("fast_recovery", 2.0)
+        self.assertAlmostEqual(values["ssthresh"], 2.0)
+
+        self.peer.send_ack(4, rwnd=64000)
+        self.wait_for_cwnd("ack", 2.5)
+        self.assertEqual(self.peer.collect_data(2, timeout=2.0), [4, 5])
+
+        self.peer.send_ack(6, rwnd=64000)
+        self.wait_for_cwnd("ack", 2.9)
+        self.assertEqual(self.peer.collect_data(2, timeout=2.0), [6, 7])
+
+        self.finish_transfer()
+
+
+class FastRecoveryInflationTests(CwndTrackingMixin, SenderTestBase):
+    """Documented simplification: no RFC 5681 3.2 steps 3-5 cwnd
+    inflation; cwnd stays at ssthresh for the recovery episode."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(8)]
+    INITIAL_CWND = 8
+
+    def test_additional_duplicate_acks_do_not_inflate_cwnd(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        for _ in range(3):
+            self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.wait_for_cwnd("fast_recovery", 4.0)
+
+        for _ in range(6):
+            self.peer.send_ack(0)
+        time.sleep(0.2)
+
+        self.assertAlmostEqual(self.controller.cwnd, 4.0)
+        recovery_rows = [
+            v for v in self.cwnd_events() if v["reason"] == "fast_recovery"
+        ]
+        self.assertEqual(len(recovery_rows), 1)
+
+        self.peer.send_ack(8)
+        self.finish_transfer()
+
+
+class RtoInteractionTests(CwndTrackingMixin, SenderTestBase):
+    """Fast retransmit must not touch the RTO; only timeouts back off
+    (RFC 6298 5.5)."""
+
+    CHUNKS = [bytes([65 + i % 26]) * 1000 for i in range(8)]
+    INITIAL_CWND = 8
+
+    def test_fast_retransmit_does_not_back_off_the_rto(self):
+        self.peer.accept_syn()
+        self.assertEqual(self.peer.collect_data(8), list(range(8)))
+
+        for _ in range(3):
+            self.peer.send_ack(0)
+        self.assertIsNotNone(self.peer.recv_data(timeout=0.5))
+        self.wait_for_cwnd("fast_recovery", 4.0)
+
+        self.assertEqual(self.events("RTO_BACKOFF"), [])
+
+        self.peer.send_ack(1)
+        self.wait_for_cwnd("ack", 4.25)
+        self.assertEqual(self.events("RTO_BACKOFF"), [])
+
         self.finish_transfer()
 
 

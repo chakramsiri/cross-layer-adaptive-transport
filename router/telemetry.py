@@ -15,9 +15,13 @@ FIELDS = [
     "marks",
     "bytes",
     "forwarded_bytes",
+    "avg_queue_packets",
+    "reason",
 ]
 
-EVENTS = ("enqueue", "forward", "drop", "error")
+EVENTS = ("enqueue", "forward", "drop", "error", "mark")
+
+REASONS = ("full", "red", "codel")
 
 
 class TelemetryLogger:
@@ -42,9 +46,14 @@ class TelemetryLogger:
         marks,
         forwarded_bytes,
         sojourn_seconds=None,
+        avg_queue=None,
+        reason=None,
     ):
         if event not in EVENTS:
             raise ValueError(f"unknown telemetry event: {event!r}")
+
+        if reason is not None and reason not in REASONS:
+            raise ValueError(f"unknown telemetry reason: {reason!r}")
 
         row = {
             "elapsed_s": f"{self._clock() - self._start:.6f}",
@@ -59,6 +68,10 @@ class TelemetryLogger:
             "marks": int(marks),
             "bytes": int(datagram_bytes),
             "forwarded_bytes": int(forwarded_bytes),
+            "avg_queue_packets": (
+                "" if avg_queue is None else f"{float(avg_queue):.3f}"
+            ),
+            "reason": "" if reason is None else reason,
         }
 
         with self._lock:

@@ -1,7 +1,12 @@
 
 import unittest
 
-from router.queues.base import EnqueueResult, Queue, QueuedPacket
+from router.queues.base import (
+    DequeueResult,
+    EnqueueResult,
+    Queue,
+    QueuedPacket,
+)
 from router.queues.droptail import DropTail
 
 
@@ -35,6 +40,18 @@ class TestQueueInterface(unittest.TestCase):
         self.assertEqual(EnqueueResult.DROPPED.value, "dropped")
         self.assertEqual(EnqueueResult.MARKED.value, "marked")
 
+    def test_dequeue_result_values(self):
+        self.assertEqual(DequeueResult.FORWARD.value, "forward")
+        self.assertEqual(DequeueResult.DROP.value, "drop")
+        self.assertEqual(DequeueResult.MARK.value, "mark")
+
+    def test_droptail_dequeue_result_is_always_forward(self):
+        queue = make_queue()
+        queue.enqueue(packet())
+
+        _dequeued, _sojourn, result = queue.dequeue()
+        self.assertIs(result, DequeueResult.FORWARD)
+
 
 class TestDropTailBasics(unittest.TestCase):
     def test_empty_dequeue_returns_none(self):
@@ -50,7 +67,7 @@ class TestDropTailBasics(unittest.TestCase):
         self.assertIs(queue.enqueue(original), EnqueueResult.ACCEPTED)
         self.assertEqual(queue.length, 1)
 
-        dequeued, _sojourn = queue.dequeue()
+        dequeued, _sojourn, _result = queue.dequeue()
         self.assertEqual(dequeued.payload, b"payload-bytes")
         self.assertEqual(dequeued.source, ("10.0.0.9", 7777))
         self.assertEqual(queue.length, 0)
@@ -62,7 +79,7 @@ class TestDropTailBasics(unittest.TestCase):
             queue.enqueue(packet(payload=f"p{index}".encode()))
 
         for index in range(5):
-            dequeued, _sojourn = queue.dequeue()
+            dequeued, _sojourn, _result = queue.dequeue()
             self.assertEqual(dequeued.payload, f"p{index}".encode())
 
     def test_capacity_counts_waiting_packets(self):
@@ -110,7 +127,7 @@ class TestDropTailDrops(unittest.TestCase):
         queue.enqueue(packet(b"dropped-1"))
         queue.enqueue(packet(b"dropped-2"))
 
-        dequeued, _sojourn = queue.dequeue()
+        dequeued, _sojourn, _result = queue.dequeue()
         self.assertEqual(dequeued.payload, b"kept")
         self.assertIsNone(queue.dequeue())
 
@@ -121,7 +138,7 @@ class TestDropTailTiming(unittest.TestCase):
         queue = make_queue(clock=clock)
 
         queue.enqueue(packet())
-        dequeued, _sojourn = queue.dequeue()
+        dequeued, _sojourn, _result = queue.dequeue()
         self.assertEqual(dequeued.enqueued_at, 500.0)
 
     def test_sojourn_measured_at_dequeue(self):
@@ -131,7 +148,7 @@ class TestDropTailTiming(unittest.TestCase):
         queue.enqueue(packet(b"a"))
         clock.advance(0.25)
 
-        _dequeued, sojourn = queue.dequeue()
+        _dequeued, sojourn, _result = queue.dequeue()
         self.assertAlmostEqual(sojourn, 0.25)
 
     def test_sojourn_per_packet(self):
@@ -143,11 +160,11 @@ class TestDropTailTiming(unittest.TestCase):
         queue.enqueue(packet(b"second"))
 
         clock.advance(0.2)
-        _packet, sojourn_first = queue.dequeue()
+        _packet, sojourn_first, _result = queue.dequeue()
         self.assertAlmostEqual(sojourn_first, 0.3)
 
         clock.advance(0.4)
-        _packet, sojourn_second = queue.dequeue()
+        _packet, sojourn_second, _result = queue.dequeue()
         self.assertAlmostEqual(sojourn_second, 0.6)
 
     def test_sojourn_is_never_negative(self):
@@ -158,14 +175,14 @@ class TestDropTailTiming(unittest.TestCase):
         queue = make_queue(clock=BackwardsClock())
         queue.enqueue(packet())
 
-        _packet, sojourn = queue.dequeue()
+        _packet, sojourn, _result = queue.dequeue()
         self.assertGreaterEqual(sojourn, 0.0)
 
     def test_default_clock_is_monotonic(self):
         queue = DropTail(2)
         queue.enqueue(packet())
 
-        dequeued, sojourn = queue.dequeue()
+        dequeued, sojourn, _result = queue.dequeue()
         self.assertGreaterEqual(sojourn, 0.0)
         self.assertLess(sojourn, 5.0)
 

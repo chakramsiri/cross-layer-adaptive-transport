@@ -3,25 +3,19 @@
 import time
 from collections import deque
 
-from router.queues.base import EnqueueResult, Queue
+from router.queues.base import (
+    DequeueResult,
+    EnqueueResult,
+    Queue,
+    validate_capacity,
+)
 
 
 class DropTail(Queue):
     """Drops arrivals when full and never marks packets."""
 
     def __init__(self, capacity, clock=time.monotonic):
-        if isinstance(capacity, bool) or not isinstance(capacity, int):
-            raise ValueError(
-                f"capacity must be an integer number of packets, "
-                f"got {capacity!r}"
-            )
-
-        if capacity < 1:
-            raise ValueError(
-                f"capacity must be at least 1 packet, got {capacity}"
-            )
-
-        self._capacity = capacity
+        self._capacity = validate_capacity(capacity)
         self._clock = clock
         self._packets = deque()
         self.drops = 0
@@ -50,4 +44,4 @@ class DropTail(Queue):
 
         packet = self._packets.popleft()
         sojourn = max(0.0, self._clock() - packet.enqueued_at)
-        return packet, sojourn
+        return packet, sojourn, DequeueResult.FORWARD

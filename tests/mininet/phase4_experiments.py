@@ -151,6 +151,7 @@ def parse_telemetry(path):
         "enqueue": 0,
         "forward": 0,
         "drop": 0,
+        "mark": 0,
         "error": 0,
         "max_queue": 0,
         "mean_queue": None,
@@ -502,7 +503,7 @@ def stop_process(process, timeout=15.0):
 
 
 def run_transfer(context, plan, args, run_dir, input_path, input_sha256,
-                 queue_capacity, bulk):
+                 queue_capacity, bulk, router_command_builder=None):
     """Run one transfer and collect its evidence; never raises for transfer failures."""
     run_dir.mkdir(parents=True, exist_ok=True)
     output_path = run_dir / "out.bin"
@@ -510,7 +511,7 @@ def run_transfer(context, plan, args, run_dir, input_path, input_sha256,
     sender_log = run_dir / "sender_log.csv"
     router_ready = run_dir / "router.ready"
 
-    router_cmd = build_router_command(
+    router_cmd = (router_command_builder or build_router_command)(
         context.python, plan, args, run_dir, queue_capacity
     )
     receiver_cmd = [

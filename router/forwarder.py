@@ -13,8 +13,15 @@ import threading
 import time
 from pathlib import Path
 
-from router.queues.base import EnqueueResult, Queue, QueuedPacket
+from router.queues.base import (
+    DequeueResult,
+    EnqueueResult,
+    Queue,
+    QueuedPacket,
+)
+from router.queues.codel import CoDel
 from router.queues.droptail import DropTail
+from router.queues.red import DEFAULT_TYPICAL_PACKET_BYTES, RED
 from router.telemetry import TelemetryLogger
 
 MAX_DATAGRAM = 65507
@@ -49,6 +56,63 @@ def parse_address(text):
 
 def format_address(address):
     return f"{address[0]}:{address[1]}"
+
+
+def build_queue(args):
+    """Instantiate the queue discipline selected by the CLI options."""
+    if args.aqm == "droptail":
+        if args.aqm_mode != "drop":
+            raise ValueError("droptail supports only --aqm-mode drop")
+        return DropTail(args.queue_capacity)
+
+    if args.aqm == "red":
+        return RED(
+            args.queue_capacity,
+            w_q=args.red_w_q,
+            min_th=args.red_min_th,
+            max_th=args.red_max_th,
+            max_p=args.red_max_p,
+            gentle=args.red_gentle,
+            mode=args.aqm_mode,
+            seed=args.red_seed,
+            typical_packet_bytes=args.red_typical_packet_bytes,
+            rate_bps=args.rate_mbps * 1_000_000 / 8,
+        )
+
+    if args.aqm == "codel":
+        return CoDel(
+            args.queue_capacity,
+            target_seconds=args.codel_target_ms / 1000.0,
+            interval_seconds=args.codel_interval_ms / 1000.0,
+            mode=args.aqm_mode,
+        )
+
+    raise ValueError(f"unknown aqm: {args.aqm!r}")
+
+
+def build_router_metadata(args, queue):
+    return {
+        "algorithm": args.aqm,
+        "mode": args.aqm_mode,
+        "queue_capacity": args.queue_capacity,
+        "rate_mbps": args.rate_mbps,
+        "rate_bytes_per_second": args.rate_mbps * 1_000_000 / 8,
+        "parameters": queue.parameters,
+        "sender_face": format_address(args.sender_face),
+        "receiver_face": format_address(args.receiver_face),
+        "receiver": format_address(args.receiver),
+        "telemetry": str(args.telemetry),
+        "pid": os.getpid(),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def write_router_metadata(args, queue):
+    path = Path(args.telemetry).parent / "router_metadata.json"
+    with open(path, "w") as file:
+        json.dump(build_router_metadata(args, queue), file, indent=2)
+        file.write("\n")
+    return path
 
 
 class Forwarder:
@@ -235,7 +299,7 @@ class Forwarder:
     def _service(self, now, last_refill, pending):
         """Refill tokens and forward what the bucket allows; returns unsent pending."""
         if pending is None and self._queue.length:
-            pending = self._queue.dequeue()
+            pending = self._apply_dequeue_result(self._queue.dequeue())
 
         size = len(pending[0].payload) if pending else 0
 
@@ -248,24 +312,48 @@ class Forwarder:
         if pending is None or self._tokens < size:
             return pending
 
-        packet, sojourn = pending
+        packet, sojourn, _result = pending
         if self._send(packet.payload, self._receiver_target, "forward"):
             self._tokens -= size
             self.counters["forwarded"] += 1
             self.counters["forwarded_bytes"] += size
-            if self._telemetry is not None:
-                self._telemetry.record(
-                    "forward",
-                    self._queue.length,
-                    size,
-                    self.counters["dropped"],
-                    self.counters["marks"],
-                    self.counters["forwarded_bytes"],
-                    sojourn_seconds=sojourn,
-                )
+            self._record("forward", sojourn, size)
             return None
 
         return pending
+
+    def _apply_dequeue_result(self, pending):
+        if pending is None:
+            return None
+
+        packet, sojourn, result = pending
+
+        if result is DequeueResult.DROP:
+            self.counters["dropped"] += 1
+            self._record("drop", sojourn, len(packet.payload), reason="codel")
+            return None
+
+        if result is DequeueResult.MARK:
+            self.counters["marks"] += 1
+            self._record("mark", sojourn, len(packet.payload), reason="codel")
+
+        return pending
+
+    def _record(self, event, sojourn, datagram_bytes, reason=None):
+        if self._telemetry is None:
+            return
+
+        self._telemetry.record(
+            event,
+            self._queue.length,
+            datagram_bytes,
+            self.counters["dropped"],
+            self.counters["marks"],
+            self.counters["forwarded_bytes"],
+            sojourn_seconds=sojourn,
+            avg_queue=self._queue.average_queue,
+            reason=reason,
+        )
 
     def _wait_timeout(self, pending, started):
         """Next service wait: token deficit, idle cap, or the max-seconds deadline."""
@@ -306,28 +394,20 @@ class Forwarder:
 
             self.sender_addr = addr
             packet = QueuedPacket(payload=data, source=addr)
+            was_full = self._queue.length >= self._queue.capacity
             result = self._queue.enqueue(packet)
 
             if result is EnqueueResult.DROPPED:
                 self.counters["dropped"] += 1
-                event = "drop"
+                reason = "full" if was_full else "red"
+                self._record("drop", None, len(data), reason=reason)
             elif result is EnqueueResult.MARKED:
                 self.counters["marks"] += 1
                 self.counters["accepted"] += 1
-                event = "enqueue"
+                self._record("mark", None, len(data), reason="red")
             else:
                 self.counters["accepted"] += 1
-                event = "enqueue"
-
-            if self._telemetry is not None:
-                self._telemetry.record(
-                    event,
-                    self._queue.length,
-                    len(data),
-                    self.counters["dropped"],
-                    self.counters["marks"],
-                    self.counters["forwarded_bytes"],
-                )
+                self._record("enqueue", None, len(data))
 
     def _handle_receiver_datagrams(self):
         while True:
@@ -415,7 +495,72 @@ def build_parser():
         "--queue-capacity",
         type=int,
         required=True,
-        help="DropTail capacity in packets",
+        help="queue capacity in packets for every discipline",
+    )
+    parser.add_argument(
+        "--aqm",
+        choices=("droptail", "red", "codel"),
+        default="droptail",
+        help="queue discipline for the forward path (default droptail)",
+    )
+    parser.add_argument(
+        "--aqm-mode",
+        choices=("drop", "mark"),
+        default="drop",
+        help="congestion signalling mode for red and codel",
+    )
+    parser.add_argument(
+        "--red-w-q",
+        type=float,
+        default=0.002,
+        help="RED EWMA weight on the instantaneous queue length",
+    )
+    parser.add_argument(
+        "--red-min-th",
+        type=float,
+        default=20.0,
+        help="RED minimum average queue threshold in packets",
+    )
+    parser.add_argument(
+        "--red-max-th",
+        type=float,
+        default=80.0,
+        help="RED maximum average queue threshold in packets",
+    )
+    parser.add_argument(
+        "--red-max-p",
+        type=float,
+        default=0.1,
+        help="RED maximum signalling probability",
+    )
+    parser.add_argument(
+        "--red-gentle",
+        action="store_true",
+        help="ramp RED signalling to certainty at twice max_th",
+    )
+    parser.add_argument(
+        "--red-seed",
+        type=int,
+        default=None,
+        help="seed for reproducible RED signalling decisions",
+    )
+    parser.add_argument(
+        "--red-typical-packet-bytes",
+        type=float,
+        default=DEFAULT_TYPICAL_PACKET_BYTES,
+        help="typical RED packet size on the bottleneck in bytes",
+    )
+    parser.add_argument(
+        "--codel-target-ms",
+        type=float,
+        default=5.0,
+        help="CoDel target sojourn in milliseconds (default 5)",
+    )
+    parser.add_argument(
+        "--codel-interval-ms",
+        type=float,
+        default=100.0,
+        help="CoDel above-target window in milliseconds (default 100)",
     )
     parser.add_argument(
         "--telemetry",
@@ -440,7 +585,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     try:
-        queue = DropTail(args.queue_capacity)
+        queue = build_queue(args)
         telemetry = TelemetryLogger(args.telemetry)
         forwarder = Forwarder(
             sender_face=args.sender_face,
@@ -452,6 +597,7 @@ def main(argv=None):
             ready_file=args.ready_file,
             max_seconds=args.max_seconds,
         )
+        write_router_metadata(args, queue)
     except (TypeError, ValueError, OSError) as error:
         print(f"router: startup failed: {error}", file=sys.stderr)
         return 1
@@ -466,7 +612,8 @@ def main(argv=None):
         f"router: sender face {format_address(args.sender_face)}, "
         f"receiver face {format_address(args.receiver_face)}, "
         f"receiver {format_address(args.receiver)}, "
-        f"rate {args.rate_mbps} Mbps, queue {args.queue_capacity} packets"
+        f"rate {args.rate_mbps} Mbps, aqm {args.aqm} ({args.aqm_mode}), "
+        f"queue {args.queue_capacity} packets"
     )
 
     try:
@@ -480,6 +627,7 @@ def main(argv=None):
         f"router: accepted={counters['accepted']} "
         f"forwarded={counters['forwarded']} "
         f"dropped={counters['dropped']} "
+        f"marks={counters['marks']} "
         f"acks_forwarded={counters['acks_forwarded']} "
         f"send_errors={counters['send_errors']}"
     )
