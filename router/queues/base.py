@@ -46,6 +46,7 @@ class QueuedPacket:
     payload: bytes
     source: tuple
     enqueued_at: float = field(default_factory=time.monotonic)
+    marked: bool = False
 
 
 class Queue(ABC):

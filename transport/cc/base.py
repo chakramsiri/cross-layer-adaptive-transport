@@ -51,4 +51,5 @@ class CongestionController(ABC):
 
     @abstractmethod
     def on_feedback(self, ce_count, q_delay):
-        """Report explicit congestion feedback (CE count, queue delay)."""
+        """Report congestion feedback: ce_count is the CE-marked packets newly
+        echoed since the last call; q_delay is the queueing delay in seconds."""

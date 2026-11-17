@@ -23,6 +23,7 @@ from router.queues.codel import CoDel
 from router.queues.droptail import DropTail
 from router.queues.red import DEFAULT_TYPICAL_PACKET_BYTES, RED
 from router.telemetry import TelemetryLogger
+from transport.feedback import stamp_forwarded_datagram
 
 MAX_DATAGRAM = 65507
 
@@ -174,6 +175,7 @@ class Forwarder:
             "forwarded": 0,
             "dropped": 0,
             "marks": 0,
+            "ce_marked": 0,
             "forwarded_bytes": 0,
             "acks_forwarded": 0,
             "send_errors": 0,
@@ -313,10 +315,15 @@ class Forwarder:
             return pending
 
         packet, sojourn, _result = pending
-        if self._send(packet.payload, self._receiver_target, "forward"):
+        datagram, ce_applied = stamp_forwarded_datagram(
+            packet.payload, sojourn, packet.marked
+        )
+        if self._send(datagram, self._receiver_target, "forward"):
             self._tokens -= size
             self.counters["forwarded"] += 1
             self.counters["forwarded_bytes"] += size
+            if ce_applied:
+                self.counters["ce_marked"] += 1
             self._record("forward", sojourn, size)
             return None
 
@@ -334,6 +341,7 @@ class Forwarder:
             return None
 
         if result is DequeueResult.MARK:
+            packet.marked = True
             self.counters["marks"] += 1
             self._record("mark", sojourn, len(packet.payload), reason="codel")
 
@@ -402,6 +410,7 @@ class Forwarder:
                 reason = "full" if was_full else "red"
                 self._record("drop", None, len(data), reason=reason)
             elif result is EnqueueResult.MARKED:
+                packet.marked = True
                 self.counters["marks"] += 1
                 self.counters["accepted"] += 1
                 self._record("mark", None, len(data), reason="red")
@@ -628,6 +637,7 @@ def main(argv=None):
         f"forwarded={counters['forwarded']} "
         f"dropped={counters['dropped']} "
         f"marks={counters['marks']} "
+        f"ce_marked={counters['ce_marked']} "
         f"acks_forwarded={counters['acks_forwarded']} "
         f"send_errors={counters['send_errors']}"
     )
