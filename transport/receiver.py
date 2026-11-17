@@ -2,8 +2,9 @@ import socket
 import sys
 from pathlib import Path
 
-from transport.packet import Packet, DATA, ACK, SYN, FIN
+from transport.packet import CE, ECE, Packet, DATA, ACK, SYN, FIN
 from transport.csv_logger import CSVLogger
+from transport.feedback import CE_MODULUS
 
 HOST = "0.0.0.0"
 PORT = 5001
@@ -17,13 +18,17 @@ RECV_BUFFER_BYTES = 64000
 logger = CSVLogger("results/receiver_log.csv")
 
 
-def send_ack(sock, address, ack_number, rwnd=0, ts_echo=0):
+def send_ack(sock, address, ack_number, rwnd=0, ts_echo=0, ce_count=0,
+             q_delay_us=0, ece=False):
     """Send a cumulative ACK with receiver's free buffer capacity (rwnd, bytes) and trigger packet's timestamp echo (ts_echo, monotonic microseconds)."""
     packet = Packet(
         packet_type=ACK,
         ack=ack_number,
         rwnd=rwnd,
-        ts_echo=ts_echo
+        ts_echo=ts_echo,
+        ce_count=ce_count,
+        q_delay_us=q_delay_us,
+        flags=ECE if ece else 0
     )
     sock.sendto(packet.pack(), address)
 
@@ -31,7 +36,10 @@ def send_ack(sock, address, ack_number, rwnd=0, ts_echo=0):
         "ACK_SENT",
         packet_type="ACK",
         ack=ack_number,
-        details=f"rwnd={rwnd}"
+        details=(
+            f"rwnd={rwnd} ce_count={ce_count} "
+            f"q_delay_us={q_delay_us} ece={int(ece)}"
+        )
     )
 
 
@@ -46,11 +54,19 @@ def receive_file(output_file):
     out_of_order = {}
     buffered_bytes = 0
     sender_address = None
+    ce_count = 0
+    ce_seen = False
+    q_delay_us = 0
 
     def current_rwnd():
         """Free receive-buffer capacity in bytes (Phase 2 flow control)."""
 
         return max(0, RECV_BUFFER_BYTES - buffered_bytes)
+
+    def send_feedback_ack(address, ack_number, ts_echo=0):
+        send_ack(sock, address, ack_number, rwnd=current_rwnd(),
+                 ts_echo=ts_echo, ce_count=ce_count,
+                 q_delay_us=q_delay_us, ece=ce_seen)
 
     with open(output_file, "wb") as file:
         while True:
@@ -86,6 +102,10 @@ def receive_file(output_file):
 
             # DATA packet
             if packet.packet_type == DATA:
+                if packet.flags & CE:
+                    ce_count = (ce_count + 1) % CE_MODULUS
+                    ce_seen = True
+                q_delay_us = packet.q_delay_us
 
                 logger.log(
                     "DATA_RECEIVED",
@@ -178,13 +198,8 @@ def receive_file(output_file):
 
                 # Cumulative ACK: next expected sequence, free capacity (rwnd),
                 # and the trigger packet's timestamp echo (ts_echo).
-                send_ack(
-                    sock,
-                    address,
-                    expected_seq,
-                    rwnd=current_rwnd(),
-                    ts_echo=packet.ts_send
-                )
+                send_feedback_ack(address, expected_seq,
+                                  ts_echo=packet.ts_send)
 
             # FIN handshake
             elif packet.packet_type == FIN:
@@ -197,8 +212,7 @@ def receive_file(output_file):
                         seq=packet.seq
                     )
 
-                    send_ack(sock, address, expected_seq,
-                             rwnd=current_rwnd())
+                    send_feedback_ack(address, expected_seq)
 
                     # Remain available for retransmitted FIN packets
                     sock.settimeout(FIN_LINGER)
@@ -229,14 +243,12 @@ def receive_file(output_file):
                                 seq=fin_packet.seq
                             )
 
-                            send_ack(sock, sender_address, expected_seq,
-                                     rwnd=current_rwnd())
+                            send_feedback_ack(sender_address, expected_seq)
 
                     break
 
                 else:
-                    send_ack(sock, address, expected_seq,
-                             rwnd=current_rwnd())
+                    send_feedback_ack(address, expected_seq)
 
     sock.close()
 

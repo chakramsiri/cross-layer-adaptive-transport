@@ -113,7 +113,7 @@ class TestForwardPath(unittest.TestCase):
     def test_control_sized_datagrams_pass_through(self):
         """SYN/FIN sized control datagrams traverse the same path."""
         fixture = ForwarderFixture(self)
-        syn = b"\x01" + b"\x00" * 28
+        syn = b"\x03" + b"\x00" * 28
 
         fin = b"\x04" + b"\x00" * 28
 

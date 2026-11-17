@@ -3,6 +3,7 @@ import sys
 import time
 
 from transport.cc.reno import RenoController
+from transport.feedback import FeedbackTracker
 from transport.packet import Packet, DATA, ACK, SYN, FIN
 from transport.csv_logger import CSVLogger
 from transport.rtt import MAX_RTO, RttEstimator, encode_timestamp, rtt_seconds
@@ -217,6 +218,26 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
             details += f" ssthresh={ssthresh:.3f}"
         logger.log("CWND_UPDATE", details=details)
 
+    feedback = FeedbackTracker()
+
+    def record_feedback(ack_packet):
+        step = feedback.observe(ack_packet.ce_count, ack_packet.q_delay_us)
+        if step is None:
+            return
+
+        logger.log(
+            "FEEDBACK",
+            packet_type="ACK",
+            ack=ack_packet.ack,
+            details=(
+                f"ce_total={feedback.ce_total} ce_new={step} "
+                f"q_delay_us={feedback.q_delay_us}"
+            )
+        )
+
+        if controller is not None:
+            controller.on_feedback(step, feedback.q_delay_us / 1_000_000)
+
     log_cwnd("init")
 
     # Sliding Window transfer
@@ -336,6 +357,8 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
             ack_is_valid = ack_number <= next_seq
 
             if ack_is_valid:
+                record_feedback(ack_packet)
+
                 # Advancing ACKs may update rwnd; duplicate ACKs may only reduce it.
                 # Stale ACKs never change the advertised window.
                 if base < ack_number <= next_seq:
@@ -603,6 +626,7 @@ def send_file(input_file, receiver_ip, controller=_CONTROLLER_UNSET):
     )
 
     if fin_ack is not None:
+        record_feedback(fin_ack)
         print("\nTransfer completed successfully.")
         print(f"Total packets sent: {total_packets}")
         print(f"Total bytes sent: {total_bytes}")

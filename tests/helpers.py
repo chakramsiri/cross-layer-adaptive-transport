@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from transport.cc.reno import RenoController
-from transport.packet import Packet, DATA, ACK, SYN, FIN
+from transport.packet import Packet, DATA, ACK, ECE, SYN, FIN
 from transport.csv_logger import CSVLogger
 from transport import sender as sender_module
 
@@ -167,7 +167,8 @@ class ScriptedPeer:
 
         return False
 
-    def send_ack(self, ack, ts_echo=0, rwnd=None):
+    def send_ack(self, ack, ts_echo=0, rwnd=None, ce_count=0,
+                 q_delay_us=0, ece=False):
         """Send an ACK, defaulting to the peer's currently advertised rwnd."""
 
         assert self.sender_addr is not None, "accept_syn() must run first"
@@ -176,7 +177,9 @@ class ScriptedPeer:
             rwnd = self.rwnd
 
         packet = Packet(
-            packet_type=ACK, ack=ack, rwnd=rwnd, ts_echo=ts_echo
+            packet_type=ACK, ack=ack, rwnd=rwnd, ts_echo=ts_echo,
+            ce_count=ce_count, q_delay_us=q_delay_us,
+            flags=ECE if ece else 0,
         )
         self.sock.sendto(packet.pack(), self.sender_addr)
 
@@ -212,9 +215,7 @@ class SenderTestBase(unittest.TestCase):
         self.addCleanup(self._restore_sender_module)
 
         if self.CONTROLLER_ENABLED:
-            self.controller = RenoController(
-                initial_cwnd=float(self.INITIAL_CWND)
-            )
+            self.controller = self.make_controller()
         else:
             self.controller = None
 
@@ -228,6 +229,9 @@ class SenderTestBase(unittest.TestCase):
         self.thread = threading.Thread(target=self._run_sender, daemon=True)
         self.addCleanup(self._stop_sender_quietly)
         self.thread.start()
+
+    def make_controller(self):
+        return RenoController(initial_cwnd=float(self.INITIAL_CWND))
 
     def _restore_sender_module(self):
         # Redirect a lingering sender thread away from the shared logger.
