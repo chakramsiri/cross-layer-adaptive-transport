@@ -47,6 +47,20 @@ def feedback(ce_total, q_delay_us):
 
 
 class VerifyFeedbackTests(unittest.TestCase):
+    def test_cross_traffic_marks_do_not_count_against_the_echo(self):
+        sender = [feedback(2, 1000)]
+        telemetry = [
+            telemetry_row("forward", "1.000"),
+            dict(telemetry_row("mark"), kind="data"),
+            dict(telemetry_row("mark"), kind="data"),
+            dict(telemetry_row("mark"), kind="cross"),
+        ]
+
+        result = verifier.verify(sender, telemetry)
+
+        self.assertTrue(result["ce_match"])
+        self.assertTrue(result["passed"])
+
     def test_matching_run_passes(self):
         sender = [
             sender_row("ACK_RECEIVED"),

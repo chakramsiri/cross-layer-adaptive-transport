@@ -57,6 +57,18 @@ class DctcpController(RenoController):
     def on_feedback(self, ce_count, q_delay):
         self._marked += ce_count
 
+    def on_loss(self, flight_size):
+        super().on_loss(flight_size)
+        self._restart_window()
+
+    def on_timeout(self, flight_size, segment_id):
+        super().on_timeout(flight_size, segment_id)
+        self._restart_window()
+
+    def _restart_window(self):
+        self._marked = 0
+        self._window.open(self._cwnd)
+
     def _end_window(self):
         fraction = min(1.0, self._marked / self._window.acked)
         self._alpha = (1.0 - self._g) * self._alpha + self._g * fraction

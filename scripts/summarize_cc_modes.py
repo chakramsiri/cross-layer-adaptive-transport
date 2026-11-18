@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import re
 import statistics
 import sys
@@ -17,9 +18,12 @@ def read_rows(path):
 
 
 def percentile(values, level):
+    """Nearest-rank percentile: the value at rank ceil(level/100 * N)."""
+    if not values:
+        raise ValueError("percentile of an empty sequence")
     ordered = sorted(values)
-    rank = max(0, min(len(ordered) - 1, round(level / 100 * len(ordered)) - 1))
-    return ordered[rank]
+    rank = math.ceil(level / 100 * len(ordered))
+    return ordered[min(len(ordered), max(1, rank)) - 1]
 
 
 def summarise_run(run_dir, root):

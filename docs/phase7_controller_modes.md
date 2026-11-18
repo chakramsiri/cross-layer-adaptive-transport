@@ -15,6 +15,15 @@ timeout drops to one packet) and the controller interface
   delay in seconds.
 - **Order within one ACK.** Growth is applied first, then the window-close
   decision, so the packet that closes a window counts toward that window.
+- **Excess ACKs.** An ACK that acknowledges more than the window target closes
+  one window. Its full acknowledged count and the marks echoed with it belong to
+  the closing window; the next window starts empty. Every acknowledged packet
+  and every mark is counted in exactly one window (no carry, no double count).
+- **Loss and timeout.** Both controllers reopen their window at the new cwnd
+  after `on_loss` or `on_timeout`, and discard feedback still pending from before
+  the loss, because the loss response already reduced cwnd. DCTCP keeps alpha,
+  which estimates persistent marking. Delay clears its congested verdict, so
+  growth resumes from the reduced window.
 
 ## Mode A: `reno` (loss-only)
 
@@ -111,6 +120,10 @@ flowchart TD
     J --> R
     K[CE / q_delay echo] --> L["window_min_delay = min(...)"]
 ```
+
+## Metrics used in the sweep
+
+Percentiles use the nearest-rank definition: the value at rank ceil(p/100 x N).
 
 ## Parameter selection
 
