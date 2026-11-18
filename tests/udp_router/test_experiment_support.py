@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -746,6 +747,69 @@ class TestInteractiveModeSupport(unittest.TestCase):
             if sleeper.poll() is None:
                 sleeper.kill()
                 sleeper.wait(timeout=5)
+
+    def test_pid_identity_survives_a_child_that_is_still_starting(self):
+        sleeper = subprocess.Popen(
+            ["bash", "-c", "exec -a phase2_node.py sleep 30"]
+        )
+        real = self.experiment.process_cmdline
+        pending_empty_reads = [2]
+
+        def starting_then_real(pid):
+            if pending_empty_reads[0] > 0:
+                pending_empty_reads[0] -= 1
+                return ""
+            return real(pid)
+
+        try:
+            with mock.patch.object(self.experiment, "process_cmdline",
+                                   side_effect=starting_then_real):
+                self.assertTrue(
+                    self.experiment.pid_matches(
+                        sleeper.pid, "phase2_node.py"
+                    )
+                )
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=5)
+
+    def test_exited_but_unreaped_child_is_not_a_live_match(self):
+        child = subprocess.Popen(["true"])
+        deadline = time.monotonic() + 5.0
+        while (self.experiment.process_state(child.pid) != "Z"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+
+        try:
+            self.assertEqual(self.experiment.process_state(child.pid), "Z")
+            self.assertFalse(self.experiment.pid_alive(child.pid))
+            self.assertFalse(
+                self.experiment.pid_matches(child.pid, "true")
+            )
+        finally:
+            child.wait(timeout=5)
+
+    def test_immediate_shutdown_reaches_every_freshly_started_child(self):
+        missed = []
+        for index in range(20):
+            sleeper = subprocess.Popen(
+                ["bash", "-c", "exec -a phase2_node.py sleep 30"]
+            )
+            name = f"receiver_{index}.pid"
+            (self.tmp / name).write_text(f"{sleeper.pid}\n")
+            try:
+                self.experiment.terminate_pid_file(self.tmp / name,
+                                                   "phase2_node.py")
+                if sleeper.wait(timeout=5) != -15:
+                    missed.append(index)
+            except subprocess.TimeoutExpired:
+                missed.append(index)
+            finally:
+                if sleeper.poll() is None:
+                    sleeper.kill()
+                    sleeper.wait(timeout=5)
+
+        self.assertEqual(missed, [])
 
     def test_shutdown_interactive_never_targets_unrelated_processes(self):
         context = _StubContext()

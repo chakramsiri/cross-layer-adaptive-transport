@@ -1120,6 +1120,7 @@ def build_manual_endpoint_commands(args, plan, run_dir, interfaces):
 
 PIDFILE_WAIT_SECONDS = 10.0
 PIDFILE_POLL_SECONDS = 0.05
+PID_IDENTITY_WAIT_SECONDS = 1.0
 
 
 def read_pid_file(path):
@@ -1141,15 +1142,35 @@ def process_cmdline(pid):
     return raw.decode(errors="replace").replace("\x00", " ").strip()
 
 
-def pid_matches(pid, expected_fragment):
-    """True when pid still runs the expected program (guards PID reuse)."""
-    cmdline = process_cmdline(pid)
-    return cmdline is not None and expected_fragment in cmdline
+def process_state(pid):
+    """Scheduler state from /proc/<pid>/stat; None once the pid is gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return stat.rsplit(")", 1)[1].split()[0]
+
+
+def pid_matches(pid, expected_fragment, timeout=PID_IDENTITY_WAIT_SECONDS):
+    """True when pid runs the expected program (guards PID reuse). A child
+    that has just been spawned can briefly show an empty command line, so
+    the check waits for it to settle before judging."""
+    deadline = time.monotonic() + timeout
+    while True:
+        cmdline = process_cmdline(pid)
+        if cmdline:
+            return expected_fragment in cmdline
+        if process_state(pid) in (None, "Z"):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PIDFILE_POLL_SECONDS)
 
 
 def pid_alive(pid):
     """True while pid runs; a zombie counts as terminated."""
-    return bool(process_cmdline(pid))
+    state = process_state(pid)
+    return state is not None and state != "Z"
 
 
 def terminate_pid_file(path, expected_fragment,
