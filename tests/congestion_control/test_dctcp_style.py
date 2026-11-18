@@ -129,3 +129,71 @@ class DctcpControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DctcpWindowAccountingTests(unittest.TestCase):
+    def test_marks_echoed_with_an_overshooting_ack_belong_to_its_window(self):
+        dctcp = DctcpController(initial_cwnd=4.0, ssthresh=2.0)
+
+        dctcp.on_feedback(9, 0.0)
+        dctcp.on_ack(9.0)
+
+        self.assertAlmostEqual(dctcp.alpha, DEFAULT_G * 1.0)
+        self.assertEqual(dctcp.window_acked, 0.0)
+
+    def test_marks_and_acks_are_each_counted_in_exactly_one_window(self):
+        dctcp = DctcpController(initial_cwnd=4.0, ssthresh=2.0, g=1.0)
+        windows_marked = []
+        marks_seen = 0
+
+        for marks, acks in ((2, 9.0), (0, 3.0), (3, 2.0)):
+            dctcp.on_feedback(marks, 0.0)
+            marks_seen += marks
+            dctcp.on_ack(acks)
+            if dctcp.window_acked == 0.0:
+                windows_marked.append(marks)
+
+        self.assertEqual(sum(windows_marked) + dctcp._marked, marks_seen)
+
+
+class DctcpLossResetTests(unittest.TestCase):
+    def test_window_reopens_at_the_post_timeout_window(self):
+        dctcp = DctcpController(initial_cwnd=10.0, ssthresh=5.0)
+        dctcp.on_ack(1.0)
+
+        dctcp.on_timeout(6.0, 0)
+
+        self.assertEqual(dctcp.window_target, 1.0)
+        self.assertEqual(dctcp.window_acked, 0.0)
+
+    def test_marks_echoed_before_a_timeout_do_not_reduce_later_windows(self):
+        dctcp = DctcpController(initial_cwnd=10.0, ssthresh=5.0)
+        dctcp.on_feedback(4, 0.0)
+        dctcp.on_ack(1.0)
+
+        dctcp.on_timeout(6.0, 0)
+        dctcp.on_ack(1.0)
+
+        self.assertEqual(dctcp.cwnd, 2.0)
+        self.assertEqual(dctcp.ssthresh, 3.0)
+
+    def test_alpha_survives_a_loss_event(self):
+        dctcp = DctcpController(initial_cwnd=10.0, ssthresh=5.0)
+        dctcp.on_feedback(10, 0.0)
+        finish_window(dctcp)
+        alpha = dctcp.alpha
+
+        dctcp.on_loss(8.0)
+        dctcp.on_timeout(4.0, 0)
+
+        self.assertAlmostEqual(dctcp.alpha, alpha)
+
+    def test_loss_discards_marks_pending_in_the_old_window(self):
+        dctcp = DctcpController(initial_cwnd=10.0, ssthresh=5.0)
+        dctcp.on_feedback(3, 0.0)
+
+        dctcp.on_loss(8.0)
+        dctcp.on_feedback(0, 0.0)
+        finish_window(dctcp)
+
+        self.assertAlmostEqual(dctcp.alpha, 0.0)

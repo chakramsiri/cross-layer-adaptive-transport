@@ -15,6 +15,7 @@ FIELDS = [
     "marks",
     "bytes",
     "forwarded_bytes",
+    "kind",
     "avg_queue_packets",
     "reason",
 ]
@@ -22,6 +23,8 @@ FIELDS = [
 EVENTS = ("enqueue", "forward", "drop", "error", "mark")
 
 REASONS = ("full", "red", "codel")
+
+KINDS = ("data", "cross", "control", "other")
 
 
 class TelemetryLogger:
@@ -48,9 +51,13 @@ class TelemetryLogger:
         sojourn_seconds=None,
         avg_queue=None,
         reason=None,
+        kind=None,
     ):
         if event not in EVENTS:
             raise ValueError(f"unknown telemetry event: {event!r}")
+
+        if kind is not None and kind not in KINDS:
+            raise ValueError(f"unknown telemetry kind: {kind!r}")
 
         if reason is not None and reason not in REASONS:
             raise ValueError(f"unknown telemetry reason: {reason!r}")
@@ -71,6 +78,7 @@ class TelemetryLogger:
             "avg_queue_packets": (
                 "" if avg_queue is None else f"{float(avg_queue):.3f}"
             ),
+            "kind": "" if kind is None else kind,
             "reason": "" if reason is None else reason,
         }
 

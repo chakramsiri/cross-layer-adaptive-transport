@@ -61,6 +61,19 @@ class DelayAwareController(RenoController):
         if self._min_delay is None or q_delay < self._min_delay:
             self._min_delay = q_delay
 
+    def on_loss(self, flight_size):
+        super().on_loss(flight_size)
+        self._restart_window()
+
+    def on_timeout(self, flight_size, segment_id):
+        super().on_timeout(flight_size, segment_id)
+        self._restart_window()
+
+    def _restart_window(self):
+        self._min_delay = None
+        self._congested = False
+        self._window.open(self._cwnd)
+
     def on_ack(self, acked_data):
         self.in_fast_recovery = False
         self._grow(acked_data)

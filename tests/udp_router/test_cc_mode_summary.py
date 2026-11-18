@@ -132,3 +132,30 @@ class CcModeSummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NearestRankPercentileTests(unittest.TestCase):
+    def test_median_of_five_values_is_the_third(self):
+        self.assertEqual(summary.percentile([1, 2, 3, 4, 5], 50), 3)
+
+    def test_extreme_levels_map_to_the_ends(self):
+        values = [1, 2, 3, 4, 5]
+
+        self.assertEqual(summary.percentile(values, 0), 1)
+        self.assertEqual(summary.percentile(values, 100), 5)
+        self.assertEqual(summary.percentile(values, 20), 1)
+        self.assertEqual(summary.percentile(values, 21), 2)
+
+    def test_high_percentiles_of_a_hundred_values(self):
+        values = list(range(1, 101))
+
+        self.assertEqual(summary.percentile(values, 50), 50)
+        self.assertEqual(summary.percentile(values, 95), 95)
+        self.assertEqual(summary.percentile(values, 99), 99)
+
+    def test_unsorted_input_is_ranked_by_value(self):
+        self.assertEqual(summary.percentile([9, 1, 5, 3, 7], 50), 5)
+
+    def test_empty_input_is_rejected(self):
+        with self.assertRaises(ValueError):
+            summary.percentile([], 50)

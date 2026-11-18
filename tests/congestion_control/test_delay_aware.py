@@ -155,3 +155,41 @@ class DelayAwareControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DelayAwareLossResetTests(unittest.TestCase):
+    def test_timeout_clears_a_congested_verdict_so_growth_resumes(self):
+        delay = DelayAwareController(initial_cwnd=4.0, ssthresh=4.0,
+                                     target_seconds=0.005)
+        delay.on_feedback(0, 0.050)
+        for _ in range(4):
+            delay.on_ack(1.0)
+        self.assertTrue(delay.congested)
+
+        delay.on_timeout(3.0, 0)
+        delay.on_feedback(0, 0.001)
+        delay.on_ack(1.0)
+
+        self.assertFalse(delay.congested)
+        self.assertEqual(delay.cwnd, 2.0)
+
+    def test_delay_samples_before_a_timeout_do_not_decide_later_windows(self):
+        delay = DelayAwareController(initial_cwnd=10.0, ssthresh=5.0,
+                                     target_seconds=0.005)
+        delay.on_feedback(0, 0.001)
+        delay.on_ack(1.0)
+
+        delay.on_timeout(6.0, 0)
+        delay.on_feedback(0, 0.050)
+        finish_window(delay)
+
+        self.assertTrue(delay.congested)
+
+    def test_loss_reopens_the_window_at_the_reduced_window(self):
+        delay = DelayAwareController(initial_cwnd=10.0, ssthresh=5.0)
+        delay.on_ack(1.0)
+
+        delay.on_loss(8.0)
+
+        self.assertEqual(delay.window_target, delay.cwnd)
+        self.assertEqual(delay.window_acked, 0.0)

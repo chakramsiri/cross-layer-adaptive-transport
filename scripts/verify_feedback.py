@@ -33,18 +33,29 @@ def feedback_samples(sender_rows):
     return samples
 
 
+FLOW_KINDS = ("", "data")
+
+
+def is_flow_row(row):
+    return row.get("kind", "") in FLOW_KINDS
+
+
 def forward_sojourns_us(telemetry_rows):
     return [
         float(row["sojourn_ms"]) * 1000.0
         for row in telemetry_rows
         if row["event"] == "forward" and row["sojourn_ms"]
+        and is_flow_row(row)
     ]
 
 
 def verify(sender_rows, telemetry_rows):
     samples = feedback_samples(sender_rows)
     sojourns = forward_sojourns_us(telemetry_rows)
-    marks = sum(1 for row in telemetry_rows if row["event"] == "mark")
+    marks = sum(
+        1 for row in telemetry_rows
+        if row["event"] == "mark" and is_flow_row(row)
+    )
 
     sender_total = max((total for total, _ in samples), default=0)
     unmatched = sum(

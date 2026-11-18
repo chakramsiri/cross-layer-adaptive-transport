@@ -24,6 +24,7 @@ from router.queues.droptail import DropTail
 from router.queues.red import DEFAULT_TYPICAL_PACKET_BYTES, RED
 from router.telemetry import TelemetryLogger
 from transport.feedback import stamp_forwarded_datagram
+from transport.packet import CROSS, DATA, FIN, SYN, TYPE_MASK
 
 MAX_DATAGRAM = 65507
 
@@ -57,6 +58,21 @@ def parse_address(text):
 
 def format_address(address):
     return f"{address[0]}:{address[1]}"
+
+
+def is_cross_datagram(data):
+    return bool(data) and (data[0] & TYPE_MASK) == CROSS
+
+
+def datagram_kind(payload):
+    if not payload:
+        return "other"
+    return {
+        DATA: "data",
+        CROSS: "cross",
+        SYN: "control",
+        FIN: "control",
+    }.get(payload[0] & TYPE_MASK, "other")
 
 
 def build_queue(args):
@@ -324,7 +340,8 @@ class Forwarder:
             self.counters["forwarded_bytes"] += size
             if ce_applied:
                 self.counters["ce_marked"] += 1
-            self._record("forward", sojourn, size)
+            self._record("forward", sojourn, size,
+                         kind=datagram_kind(packet.payload))
             return None
 
         return pending
@@ -337,17 +354,19 @@ class Forwarder:
 
         if result is DequeueResult.DROP:
             self.counters["dropped"] += 1
-            self._record("drop", sojourn, len(packet.payload), reason="codel")
+            self._record("drop", sojourn, len(packet.payload), reason="codel",
+                         kind=datagram_kind(packet.payload))
             return None
 
         if result is DequeueResult.MARK:
             packet.marked = True
             self.counters["marks"] += 1
-            self._record("mark", sojourn, len(packet.payload), reason="codel")
+            self._record("mark", sojourn, len(packet.payload), reason="codel",
+                         kind=datagram_kind(packet.payload))
 
         return pending
 
-    def _record(self, event, sojourn, datagram_bytes, reason=None):
+    def _record(self, event, sojourn, datagram_bytes, reason=None, kind=None):
         if self._telemetry is None:
             return
 
@@ -361,6 +380,7 @@ class Forwarder:
             sojourn_seconds=sojourn,
             avg_queue=self._queue.average_queue,
             reason=reason,
+            kind=kind,
         )
 
     def _wait_timeout(self, pending, started):
@@ -400,7 +420,8 @@ class Forwarder:
                 self._warn(f"sender face recv failed: {error}")
                 return
 
-            self.sender_addr = addr
+            if not is_cross_datagram(data):
+                self.sender_addr = addr
             packet = QueuedPacket(payload=data, source=addr)
             was_full = self._queue.length >= self._queue.capacity
             result = self._queue.enqueue(packet)
@@ -408,15 +429,18 @@ class Forwarder:
             if result is EnqueueResult.DROPPED:
                 self.counters["dropped"] += 1
                 reason = "full" if was_full else "red"
-                self._record("drop", None, len(data), reason=reason)
+                self._record("drop", None, len(data), reason=reason,
+                             kind=datagram_kind(data))
             elif result is EnqueueResult.MARKED:
                 packet.marked = True
                 self.counters["marks"] += 1
                 self.counters["accepted"] += 1
-                self._record("mark", None, len(data), reason="red")
+                self._record("mark", None, len(data), reason="red",
+                             kind=datagram_kind(data))
             else:
                 self.counters["accepted"] += 1
-                self._record("enqueue", None, len(data))
+                self._record("enqueue", None, len(data),
+                             kind=datagram_kind(data))
 
     def _handle_receiver_datagrams(self):
         while True:
